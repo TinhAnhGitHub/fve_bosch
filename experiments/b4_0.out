@@ -1,0 +1,20 @@
+fold 0 of seed 0: train 1633, held-out 409
+images loaded in 17s (torch.Size([1633, 3, 512, 512]))
+frozen DINOv3-L/16 : no-kNN 47.03 | +kNN 41.31
+frozen B3.4 (v2+v3H): no-kNN 45.51 | +kNN 41.58   (this fold; B3.4 CV avg is 40.82)
+trainable: LoRA 2.36M + head 1.06M
+epoch 1/10  loss 0.692 (r 0.419, mode 0.417, aux 0.649)  305s  peak 1.43 GB
+epoch 2/10  loss 0.591 (r 0.361, mode 0.348, aux 0.565)  654s  peak 1.43 GB  | held-out sMAPE 47.34  corr(r_hat, r) 0.198
+epoch 3/10  loss 0.436 (r 0.312, mode 0.151, aux 0.488)  1036s  peak 1.43 GB
+epoch 4/10  loss 0.366 (r 0.256, mode 0.133, aux 0.436)  1370s  peak 1.43 GB  | held-out sMAPE 45.03  corr(r_hat, r) 0.291
+epoch 5/10  loss 0.267 (r 0.207, mode 0.044, aux 0.383)  1754s  peak 1.43 GB
+epoch 6/10  loss 0.213 (r 0.164, mode 0.027, aux 0.353)  2116s  peak 1.43 GB  | held-out sMAPE 43.33  corr(r_hat, r) 0.274
+epoch 7/10  loss 0.157 (r 0.120, mode 0.010, aux 0.316)  2517s  peak 1.43 GB
+epoch 8/10  loss 0.126 (r 0.094, mode 0.005, aux 0.293)  2860s  peak 1.43 GB  | held-out sMAPE 40.97  corr(r_hat, r) 0.299
+epoch 9/10  loss 0.106 (r 0.076, mode 0.005, aux 0.280)  3248s  peak 1.43 GB
+epoch 10/10  loss 0.092 (r 0.063, mode 0.003, aux 0.270)  3581s  peak 1.43 GB  | held-out sMAPE 40.28  corr(r_hat, r) 0.308
+
+FINE-TUNED heads, held-out fold: sMAPE 40.28  (corr r 0.308)
+fine-tuned + kNN (diagnostic, leaky train features): 39.07
+
+SAME FOLD:  frozen L/16 47.03/41.31 (no-kNN/+kNN) | frozen B3.4 45.51/41.58 | fine-tuned heads 40.28

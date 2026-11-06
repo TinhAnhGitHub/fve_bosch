@@ -1,0 +1,4 @@
+fold 1: saved held-out (409, 6) and val (511, 6) outputs
+/mnt/c/tinhanh/project/ai_challenge/submissions/b4_0_fold1/preds_volume.zip
+min=0.73 median=104.26 max=18066.45
+vs B3.4: median |ln ratio| 0.174, cluster-size disagreements (>30x) 4
