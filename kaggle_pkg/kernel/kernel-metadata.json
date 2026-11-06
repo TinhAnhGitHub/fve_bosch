@@ -1,0 +1,13 @@
+{
+  "id": "anhanhanhanh/fve-b42-train",
+  "title": "fve-b42-train",
+  "code_file": "launcher.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": ["anhanhanhanh/fve-bosch-data", "anhanhanhanh/fve-b42-prep", "anhanhanhanh/cradio-v4-h"],
+  "competition_sources": [],
+  "kernel_sources": []
+}
