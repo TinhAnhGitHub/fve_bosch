@@ -1,0 +1,35 @@
+B3.2 base (= B3)                              sMAPE  48.95 ±0.43 | normal 47.18 oversized 66.34 | R² 0.277 AUC 0.886 | 264s
+
+-- A: which layers / tokens
+B3.2A blocks=last layer                       sMAPE  49.18 ±0.06 | normal 47.56 oversized 65.14 | R² 0.253 AUC 0.893 | 61s
+B3.2A blocks=layers 18+24                     sMAPE  49.39 ±0.41 | normal 47.74 oversized 65.69 | R² 0.265 AUC 0.902 | 141s
+B3.2A blocks=CLS only                         sMAPE  48.43 ±0.15 | normal 46.77 oversized 64.77 | R² 0.287 AUC 0.913 | 90s
+B3.2A blocks=mean-patch only                  sMAPE  50.44 ±0.23 | normal 48.60 oversized 68.50 | R² 0.234 AUC 0.870 | 260s
+
+-- B: PCA size
+B3.2B CLS only pca=128                        sMAPE  49.50 ±0.50 | normal 47.88 oversized 65.44 | R² 0.249 AUC 0.912 | 146s
+B3.2B CLS only pca=512                        sMAPE  47.88 ±0.37 | normal 46.20 oversized 64.53 | R² 0.321 AUC 0.923 | 460s
+B3.2B CLS only pca=None                       sMAPE  47.49 ±0.25 | normal 45.85 oversized 63.65 | R² 0.348 AUC 0.926 | 490s
+
+-- C: classifier strength
+B3.2C C=0.005                                 sMAPE  47.69 ±0.13 | normal 45.57 oversized 68.55 | R² 0.348 AUC 0.927 | 342s
+B3.2C C=0.01                                  sMAPE  47.45 ±0.08 | normal 45.66 oversized 65.10 | R² 0.348 AUC 0.926 | 509s
+B3.2C C=0.02                                  sMAPE  47.46 ±0.17 | normal 45.77 oversized 64.12 | R² 0.348 AUC 0.927 | 217s
+B3.2C C=0.1                                   sMAPE  47.49 ±0.20 | normal 45.87 oversized 63.39 | R² 0.348 AUC 0.926 | 128s
+B3.2C C=0.3                                   sMAPE  47.51 ±0.28 | normal 45.94 oversized 63.05 | R² 0.348 AUC 0.925 | 117s
+B3.2C C=1.0                                   sMAPE  47.45 ±0.16 | normal 45.93 oversized 62.42 | R² 0.348 AUC 0.924 | 118s
+
+-- D: mode threshold and correction clip
+B3.2D tau=0.3                                 sMAPE  47.62 ±0.42 | normal 46.69 oversized 56.81 | R² 0.348 AUC 0.926 | 102s
+B3.2D tau=0.4                                 sMAPE  47.47 ±0.21 | normal 46.06 oversized 61.39 | R² 0.348 AUC 0.926 | 99s
+B3.2D tau=0.6                                 sMAPE  47.84 ±0.24 | normal 45.39 oversized 71.94 | R² 0.348 AUC 0.926 | 112s
+B3.2D tau=0.7                                 sMAPE  47.77 ±0.19 | normal 44.86 oversized 76.42 | R² 0.348 AUC 0.926 | 79s
+B3.2D clip=0.75                               sMAPE  48.14 ±0.11 | normal 46.44 oversized 64.88 | R² 0.290 AUC 0.926 | 83s
+B3.2D clip=1.0                                sMAPE  47.84 ±0.12 | normal 46.09 oversized 65.09 | R² 0.320 AUC 0.926 | 83s
+B3.2D clip=2.5                                sMAPE  47.37 ±0.06 | normal 45.57 oversized 65.10 | R² 0.351 AUC 0.926 | 94s
+
+best config: Config(name='B3.2D clip=2.5', features=(('dinov2l_reg_518', (0, 2, 4)),), n_pca=None, C=0.01, r_clip=2.5, tau=0.5, use_ridge=True, use_mode=True)
+
+-- fresh seeds 3-5 (not used for any choice above)
+B3 base [fresh seeds]                         sMAPE  48.67 ±0.05 | normal 47.00 oversized 65.07 | R² 0.278 AUC 0.908 | 70s
+B3.2D clip=2.5 [fresh seeds]                  sMAPE  47.43 ±0.23 | normal 45.41 oversized 67.36 | R² 0.350 AUC 0.934 | 94s

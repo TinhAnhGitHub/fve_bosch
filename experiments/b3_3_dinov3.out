@@ -1,0 +1,13 @@
+feature files: ['dinov2l_reg_518', 'dinov3_vitl16_512', 'dinov3_vith16plus_512', 'dinov3_vitl16_768'] | knobs: {'n_pca': None, 'C': 0.01, 'tau': 0.5, 'r_clip': 2.5} blocks: (0, 2, 4)
+B3.3 dinov2l_reg_518                          sMAPE  47.37 ±0.06 | normal 45.57 oversized 65.10 | R² 0.351 AUC 0.926 | 120s
+B3.3 dinov3_vitl16_512                        sMAPE  46.78 ±0.27 | normal 44.99 oversized 64.45 | R² 0.353 AUC 0.950 | 124s
+B3.3 dinov3_vith16plus_512                    sMAPE  45.00 ±0.03 | normal 43.43 oversized 60.47 | R² 0.402 AUC 0.949 | 194s
+B3.3 dinov3_vitl16_768                        sMAPE  45.82 ±0.16 | normal 44.20 oversized 61.75 | R² 0.385 AUC 0.957 | 190s
+B3.3 v2 + dinov3_vith16plus_512 pca=None      sMAPE  44.71 ±0.12 | normal 43.16 oversized 60.00 | R² 0.413 AUC 0.946 | 154s
+B3.3 v2 + dinov3_vith16plus_512 pca=512       sMAPE  45.36 ±0.03 | normal 43.84 oversized 60.35 | R² 0.383 AUC 0.940 | 151s
+B3.3 all DINOv3 files                         sMAPE  45.25 ±0.44 | normal 43.84 oversized 59.14 | R² 0.390 AUC 0.952 | 162s
+
+best: B3.3 v2 + dinov3_vith16plus_512 pca=None  44.71
+fresh seeds 3-5:
+B3.3 v2 + dinov3_vith16plus_512 pca=None [fresh seeds] sMAPE  44.35 ±0.56 | normal 42.91 oversized 58.57 | R² 0.415 AUC 0.951 | 117s
+permutation test: {'R2_real': np.float64(0.4283), 'R2_null_max': np.float64(0.0305), 'p_R2': np.float64(0.0476), 'AUC_real': 0.9495, 'AUC_null_max': np.float64(0.6103), 'p_AUC': np.float64(0.0476)}
