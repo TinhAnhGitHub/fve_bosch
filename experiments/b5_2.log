@@ -1,0 +1,5 @@
+B3.4 baseline                                           seeds0-2 40.82 | seeds3-5 40.19
+dinov3_convnext_b_512 alone                             seeds0-2 43.60 | seeds3-5 43.51
+baseline + dinov3_convnext_b_512                        seeds0-2 40.58 | seeds3-5 39.95
+dinov3_convnext_l_512 alone                             seeds0-2 43.67 | seeds3-5 43.59
+baseline + dinov3_convnext_l_512                        seeds0-2 40.44 | seeds3-5 40.00
