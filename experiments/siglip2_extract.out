@@ -1,0 +1,5 @@
+[transformers] Model config: bos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49406. This may result in unexpected behavior.
+[transformers] Model config: eos_token_id must be `None` or an integer within the vocabulary (between 0 and 31999), got 49407. This may result in unexpected behavior.
+google/siglip2-so400m-patch16-512 vision: 429M params, 27 layers, size 512, layers [14, 20, 27]; 2553 images
+  batch 0/160  49s  peak VRAM 2.14 GB
+saved (2553, 6912) -> /mnt/c/tinhanh/project/ai_challenge/features/siglip2_so400m_512.npz in 365s

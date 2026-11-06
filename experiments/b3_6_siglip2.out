@@ -1,0 +1,10 @@
+B3.4  DINOv2 + DINOv3-H+             best  40.82 ±0.21 (k=2, w_ridge=0.25, w_clf=0.25) | no-kNN  44.71 | kNN-only  42.22
+SigLIP2 alone                        best  41.86 ±0.04 (k=2, w_ridge=0.25, w_clf=0.5) | no-kNN  47.61 | kNN-only  42.93
+DINOv2 + SigLIP2 (replace DINOv3)    best  41.33 ±0.33 (k=2, w_ridge=0.25, w_clf=0.5) | no-kNN  46.34 | kNN-only  42.56
+DINOv3-H+ + SigLIP2                  best  40.27 ±0.22 (k=2, w_ridge=0.25, w_clf=0.75) | no-kNN  44.34 | kNN-only  41.87
+DINOv2 + DINOv3-H+ + SigLIP2         best  40.52 ±0.28 (k=2, w_ridge=0.25, w_clf=0.75) | no-kNN  44.13 | kNN-only  42.14
+
+best feature set on seeds 0-2: DINOv3-H+ + SigLIP2
+fresh seeds 3-5: B3.4  DINOv2 + DINOv3-H+             40.19
+fresh seeds 3-5: DINOv3-H+ + SigLIP2                  39.88
+gain on fresh seeds: 0.31
