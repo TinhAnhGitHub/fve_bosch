@@ -1,0 +1,14 @@
+B3.4 decode (tau=0.5, delta=0) seeds 0-2: 40.82
+
+by tau (delta=0):
+tau     0.25   0.3   0.35   0.40   0.45   0.50   0.55   0.60   0.65   0.70   0.75
+smape  41.82  41.8  41.66  40.95  40.76  40.82  40.95  40.99  41.36  41.51  41.60
+
+by delta (tau=0.5):
+delta  -0.12  -0.10  -0.08  -0.06  -0.04  -0.02   0.00   0.02   0.04   0.06   0.08   0.10   0.12
+smape  42.32  41.83  41.44  41.13  40.93  40.82  40.82  40.93  41.14  41.46  41.88  42.37  42.94
+
+best: tau=0.45 delta=0.0 -> 40.76 (gain 0.06)
+two-cluster objects: 369 of 2042
+fresh seeds 3-5: B3.4 40.19 | B3.5 40.04 | gain 0.15
+gain < 0.5 on fresh seeds: keep B3.4 decoding, no new submission

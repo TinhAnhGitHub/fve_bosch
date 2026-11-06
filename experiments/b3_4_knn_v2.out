@@ -1,0 +1,26 @@
+B3.3 (no kNN) on seeds 0-2: 44.71
+
+top 10 kNN blends (seeds 0-2):
+ k  w_ridge  w_clf  smape   std
+ 2     0.25   0.25 40.817 0.211
+ 2     0.25   0.50 40.832 0.226
+ 2     0.25   0.75 40.875 0.126
+ 1     0.50   0.75 41.032 0.221
+ 2     0.50   0.25 41.057 0.201
+ 2     0.50   0.50 41.063 0.203
+ 2     0.25   0.00 41.063 0.214
+ 2     0.50   0.75 41.095 0.095
+ 2     0.25   1.00 41.171 0.150
+ 1     0.50   0.50 41.197 0.385
+
+kNN alone (w_ridge=0, w_clf=0) by k:
+ k  w_ridge  w_clf  smape  std
+ 1      0.0    0.0  43.62 0.31
+ 2      0.0    0.0  42.22 0.06
+ 3      0.0    0.0  43.07 0.16
+ 4      0.0    0.0  43.64 0.35
+ 5      0.0    0.0  44.64 0.39
+10      0.0    0.0  46.91 0.30
+
+fresh seeds 3-5: B3.3 44.35 | best blend (k=2, w_ridge=0.25, w_clf=0.25) 40.19 | gain 4.16
+submission: min=1.03 median=113.76 max=19393.28 -> /mnt/c/tinhanh/project/ai_challenge/submissions/b3_4_knn/preds_volume.zip
