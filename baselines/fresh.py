@@ -185,12 +185,12 @@ class _Crops:
         return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.6, jitter: bool = False):
+def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
     import random
 
     x, y, w, h = [float(v) for v in bbox]
     if jitter:
-        pad = random.uniform(0.3, 0.9)
+        pad = random.uniform(0.0, 0.2)
         x += random.uniform(-0.08, 0.08) * w
         y += random.uniform(-0.08, 0.08) * h
     box = (
@@ -243,8 +243,8 @@ def train_fresh() -> None:
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
             logit = _logit(net, head, color, bias, x, k)
-            target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
-            loss = F.binary_cross_entropy_with_logits(logit, target)
+            # Squared grade error: a two-step miss costs four times a one-step miss.
+            loss = F.mse_loss(torch.sigmoid(logit).sum(1), y.float())
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -611,8 +611,8 @@ def cv() -> None:
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
             logit = _logit(net, head, color, bias, x, k)
-            target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
-            loss = F.binary_cross_entropy_with_logits(logit, target)
+            # Squared grade error: a two-step miss costs four times a one-step miss.
+            loss = F.mse_loss(torch.sigmoid(logit).sum(1), y.float())
             opt.zero_grad()
             loss.backward()
             opt.step()
