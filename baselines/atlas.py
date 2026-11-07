@@ -2,14 +2,14 @@
 # requires-python = ">=3.10"
 # dependencies = ["numpy", "pillow", "torch", "trimesh"]
 # ///
-"""AtlasNet baseline for Food 3D Reconstruction.
+"""Category-template baseline for Food 3D Reconstruction.
 
-Groueix et al., CVPR 2018: a decoder folds a 2D grid onto the surface.
-The image code is a frozen DINOv2 ViT-B/14 (Oquab et al., 2023), squeezed to
-64 dimensions and added to a learned category vector. Targets are the
-canonical millimetre clouds from geom.py, so the Chamfer loss supervises
-shape and size and ignores the arbitrary scan pose. The category vector is
-not a retrieved training mesh.
+A frozen DINOv2 ViT-B/14 (Oquab et al., 2023) reads the image. Each category
+has one learned millimetre template (initialized from the median-sized
+training cloud). The image adds a low-rank offset and a scale. Targets are
+the canonical clouds from geom.py, so the loss sees shape and size and not
+the scan pose. The template is one cloud per category, not a mesh retrieved
+by appearance.
 
   uv run baselines/atlas.py cache
   uv run baselines/atlas.py train
@@ -37,7 +37,6 @@ OUT = ROOT / "baselines" / "out" / "atlas"
 CKPT = OUT / "atlas.pt"
 IMAGE = 224
 N = MIN_POINTS
-PATCHES = 8
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
@@ -109,42 +108,29 @@ def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32)
 
 
 class Atlas(nn.Module):
-    """Fold PATCHES grids into one millimetre point cloud of N points.
+    """One template per category, plus an image offset and a scale.
 
-    The image code is a 64-d bottleneck added to the category code. The raw
-    768-d vector memorised the training clouds (train CD ~90, public CD 733).
+    The folded 768-d decoder scored 733 and then memorised the training
+    clouds. A 64-d bottleneck scored 864. The template holds the category
+    shape, so the image only has to move it.
     """
 
-    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES) -> None:
+    def __init__(self, dim: int, n_cat: int, n: int = N, k: int = 32) -> None:
         super().__init__()
-        g = int((n // patches) ** 0.5)
-        if g * g * patches != n:
-            raise ValueError(f"{n} is not {patches} square grids")
-        axis = torch.linspace(-1.0, 1.0, g)
-        yy, xx = torch.meshgrid(axis, axis, indexing="ij")
-        self.register_buffer("grid", torch.stack([xx, yy], -1).reshape(-1, 2))
-        self.cat = nn.Embedding(n_cat, 64)
-        self.img = nn.Linear(dim, 64)
-        nn.init.normal_(self.img.weight, std=0.01)
-        nn.init.zeros_(self.img.bias)
-        self.patch = nn.Parameter(torch.randn(patches, 16) * 0.02)
-        self.mlp = nn.Sequential(
-            nn.Linear(64 + 16 + 2, 512),
-            nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 3),
-        )
+        self.tmpl = nn.Parameter(torch.zeros(n_cat, n, 3))
+        self.basis = nn.Parameter(torch.randn(k, n, 3) * 0.01)
+        self.coeff = nn.Linear(dim, k)
+        self.scale = nn.Linear(dim, 1)
+        nn.init.zeros_(self.coeff.weight)
+        nn.init.zeros_(self.coeff.bias)
+        nn.init.zeros_(self.scale.weight)
+        nn.init.zeros_(self.scale.bias)
 
     def forward(self, feat: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
-        code = self.cat(cat) + self.img(feat)
-        b, p, g = code.shape[0], self.patch.shape[0], self.grid.shape[0]
-        parts = [
-            code[:, None, None, :].expand(b, p, g, -1),
-            self.patch[None, :, None, :].expand(b, p, g, -1),
-            self.grid[None, None].expand(b, p, g, -1),
-        ]
-        return self.mlp(torch.cat(parts, -1)).reshape(b, p * g, 3)
+        delta = torch.einsum("bk,knd->bnd", self.coeff(feat), self.basis)
+        # ponytail: tanh caps scale at about 7x. Wider tails need a bigger multiplier.
+        size = torch.exp(self.scale(feat).tanh() * 2.0)
+        return (self.tmpl[cat] + delta) * size[:, None, :]
 
 
 def cd_l2(pred: torch.Tensor, gt: torch.Tensor, k: int = 2048) -> torch.Tensor:
@@ -199,6 +185,19 @@ def _load_cache():
     return z, vocab
 
 
+def _median_templates(pts: torch.Tensor, cat: torch.Tensor, n_cat: int) -> torch.Tensor:
+    """One cloud per category: the sample whose size is closest to the median."""
+    tmpl = torch.zeros(n_cat, pts.shape[1], pts.shape[2])
+    rms = pts.square().mean(dim=(1, 2)).sqrt()
+    for c in range(n_cat):
+        idx = (cat == c).nonzero().flatten()
+        if len(idx) == 0:
+            continue
+        r = rms[idx]
+        tmpl[c] = pts[idx[(r - r.median()).abs().argmin()]]
+    return tmpl
+
+
 def train() -> None:
     z, vocab = _load_cache()
     dev = device()
@@ -210,6 +209,8 @@ def train() -> None:
     cut = max(1, int(len(order) * 0.1))
     val, tr = order[:cut], order[cut:]
     net = Atlas(feats.shape[1], len(vocab)).to(dev)
+    with torch.no_grad():
+        net.tmpl.copy_(_median_templates(pts, cat, len(vocab)))
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
     batch = 4 if dev.type == "cuda" else 2
     best, best_score = None, float("inf")
@@ -220,7 +221,9 @@ def train() -> None:
         seen = 0
         for i in range(0, len(tr), batch):
             b = tr[i : i + batch]
-            loss = cd_l2(net(feats[b].to(dev), cat[b].to(dev)), pts[b].to(dev))
+            pred = net(feats[b].to(dev), cat[b].to(dev))
+            gt = pts[b].to(dev)
+            loss = cd_l2(pred, gt) + (pred.square().mean((1, 2)).sqrt() - gt.square().mean((1, 2)).sqrt()).square().mean()
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -277,8 +280,9 @@ def predict() -> None:
 
 def fit_check() -> None:
     torch.manual_seed(0)
-    net = Atlas(8, 2, n=128, patches=2)
-    # 128 = 2 * 8 * 8. Rebuild a matching grid by constructing with n=128.
+    net = Atlas(8, 1, n=128, k=4)
+    with torch.no_grad():
+        net.tmpl[0, :, 0] = torch.linspace(0, 10, 128)
     feat = torch.zeros(1, 8)
     cat = torch.zeros(1, dtype=torch.long)
     target = torch.zeros(1, 128, 3)
