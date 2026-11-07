@@ -306,7 +306,8 @@ def _feat(net, x):
     raw = (x * std + mean).clamp(0, 1)
     h = raw.shape[-2] // 4
     center = raw[:, :, h : 3 * h, h : 3 * h]
-    color = torch.cat([center.mean(dim=(2, 3)), center.std(dim=(2, 3))], 1)
+    flat = center.flatten(2)
+    color = torch.cat([torch.quantile(flat, 0.2, dim=2), torch.quantile(flat, 0.8, dim=2)], 1)
     return torch.cat([net(x), color], 1)
 
 
