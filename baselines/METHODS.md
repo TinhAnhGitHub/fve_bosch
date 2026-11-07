@@ -12,11 +12,11 @@ Three published methods fit this setting.
    loss sees shape and size and not the arbitrary scan pose. Command:
    `uv run baselines/baseline.py train`.
 
-2. **AtlasNet / FoldingNet** (Groueix et al. 2018, Yang et al. 2018). A decoder folds a
-   2D grid onto the surface, so the output is a sheet rather than a loose point set.
-   The IJCAI 2020 single-image reconstruction challenge used this family and scored
-   Chamfer directly. Same canonical-frame loss as (1). Heavier decoder, not in this
-   baseline.
+2. **AtlasNet** (Groueix et al., CVPR 2018), which is what `baselines/atlas.py`
+   trains. A frozen DINOv2 ViT-B/14 reads the image. A decoder folds eight grids
+   onto the surface, 8192 points, and the loss is the challenge CD-L2 in the
+   canonical millimetre frame. The category folder is a learned vector, not a
+   retrieved mesh. ViT-B/14 at 224 fits an L4.
 
 3. **Arbitrary-scale mesh, then a learned volume scale** (Gao, Coburn, Raghavan, He,
    Zhu, "Size Matters", 2026). One-2-3-45 reconstructs a mesh in unknown units from one
