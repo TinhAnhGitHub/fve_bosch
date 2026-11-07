@@ -439,6 +439,156 @@ def fit() -> None:
     (OUT / "thresh.json").write_text(json.dumps({str(k): list(v) for k, v in full.items()}))
 
 
+def _matched(image_ids, by_image):
+    import torch
+    from PIL import Image
+    from ultralytics import YOLO
+
+    meta = json.loads((OUT / "meta.json").read_text())
+    ids = meta["ids"]
+    group_a = set(meta["group_a"])
+    det = YOLO(str(next((OUT / "det").rglob("last.pt"))))
+    images = [(i, by_image[i][0][0]) for i in sorted(image_ids)]
+    boxes = []
+    for start in range(0, len(images), 16):
+        chunk = images[start : start + 16]
+        results = det.predict(
+            [str(p) for _, p in chunk], imgsz=IMGSZ, conf=0.001, iou=0.7, max_det=300, batch=4, verbose=False,
+        )
+        for (image_id, path), result in zip(chunk, results):
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            im = Image.open(path).convert("RGB")
+            preds = []
+            for (x1, y1, x2, y2), k, score in zip(
+                result.boxes.xyxy.cpu().numpy(),
+                result.boxes.cls.cpu().numpy().astype(int),
+                result.boxes.conf.cpu().numpy(),
+            ):
+                if (x2 - x1) < 1 or (y2 - y1) < 1:
+                    continue
+                cat = ids[int(k)]
+                if cat not in group_a:
+                    continue
+                crop = _Crops([], False).tf(_crop(im, (float(x1), float(y1), float(x2 - x1), float(y2 - y1))))
+                preds.append((float(score), cat, [float(x1), float(y1), float(x2 - x1), float(y2 - y1)], crop))
+            used = set()
+            gt = by_image[image_id]
+            for _score, cat, box, crop in sorted(preds, key=lambda r: -r[0]):
+                best_i, best_u = None, 0.5
+                for i, sample in enumerate(gt):
+                    if i in used or sample[3] != cat:
+                        continue
+                    u = _iou(box, sample[1])
+                    if u >= best_u:
+                        best_i, best_u = i, u
+                if best_i is None:
+                    continue
+                used.add(best_i)
+                boxes.append((crop, gt[best_i][2], cat))
+    return boxes
+
+
+def _score_boxes(net, head, bias, boxes, device) -> float:
+    import numpy as np
+    import torch
+
+    net.eval()
+    x = torch.stack([b[0] for b in boxes]).to(device)
+    k = torch.tensor([b[2] - 1 for b in boxes], device=device)
+    with torch.no_grad():
+        grade = (torch.sigmoid(head(net(x)) + bias[k]) > 0.5).sum(1).cpu().numpy()
+    scores = []
+    cats = np.asarray([b[2] for b in boxes])
+    true = np.asarray([b[1] for b in boxes])
+    for cat in range(1, 11):
+        m = cats == cat
+        if int(m.sum()) < 2:
+            continue
+        scores.append(_qwk(true[m], grade[m]))
+    return float(sum(scores) / len(scores)) if scores else 0.0
+
+
+def cv() -> None:
+    import torch
+    import torch.nn.functional as F
+    from collections import Counter
+    from torch.utils.data import DataLoader, WeightedRandomSampler
+    from torchvision import models
+
+    samples = group_a_crops()
+    by_image = {}
+    for sample in samples:
+        by_image.setdefault(sample[4], []).append(sample)
+    ids = sorted(by_image)
+    rng = random.Random(0)
+    rng.shuffle(ids)
+    hold = set(ids[: max(1, len(ids) // 5)])
+    for cat in range(1, 11):
+        have = sum(s[3] == cat for i in hold for s in by_image[i])
+        if have >= 2:
+            continue
+        for image_id in ids:
+            if image_id in hold:
+                continue
+            if any(s[3] == cat for s in by_image[image_id]):
+                hold.add(image_id)
+                break
+    boxes = _matched(hold, by_image)
+    print("hold", len(hold), "matched", len(boxes), Counter(b[2] for b in boxes), flush=True)
+    if len(boxes) < 10:
+        raise SystemExit("holdout has too few matched boxes")
+    train_samples = [s for s in samples if s[4] not in hold]
+    net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+    dim = net.classifier[0].in_features
+    net.classifier = torch.nn.Identity()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net = net.to(device)
+    head = torch.nn.Linear(dim, 1, bias=False).to(device)
+    bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
+    opt = torch.optim.AdamW(
+        [
+            {"params": net.parameters(), "lr": 1e-4},
+            {"params": [head.weight, bias], "lr": 1e-3},
+        ],
+        weight_decay=1e-4,
+    )
+    counts = Counter((s[3], s[2]) for s in train_samples)
+    weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
+    best = -1.0
+    (OUT / "thresh.json").unlink(missing_ok=True)
+    for epoch in range(1, 31):
+        net.train()
+        total, seen = 0.0, 0
+        for x, y, k in loader:
+            x, y, k = x.to(device), y.to(device), k.to(device)
+            logit = head(net(x)) + bias[k]
+            target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
+            loss = F.binary_cross_entropy_with_logits(logit, target)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            total += float(loss.detach()) * len(y)
+            seen += len(y)
+        score = _score_boxes(net, head, bias, boxes, device)
+        mark = ""
+        if score > best:
+            best = score
+            mark = " saved"
+            torch.save(
+                {
+                    "net": {k: v.detach().cpu() for k, v in net.state_dict().items()},
+                    "head": head.weight.detach().cpu(),
+                    "bias": bias.detach().cpu(),
+                },
+                OUT / "coral.pt",
+            )
+        print(f"epoch {epoch} loss {total / seen:.4f} cv_qwk {score:.4f}{mark}", flush=True)
+    print(f"best cv_qwk {best:.4f}", flush=True)
+
+
 def predict() -> None:
     import torch
     from PIL import Image
@@ -516,10 +666,12 @@ def main() -> None:
         train_fresh()
     elif cmd == "fit":
         fit()
+    elif cmd == "cv":
+        cv()
     elif cmd == "predict":
         predict()
     else:
-        raise SystemExit("usage: fresh.py prep|train|fresh|fit|predict")
+        raise SystemExit("usage: fresh.py prep|train|fresh|fit|cv|predict")
 
 
 if __name__ == "__main__":
