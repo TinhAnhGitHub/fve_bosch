@@ -4,7 +4,7 @@ Public score to beat: **0.75** (team claude). Overall = `0.6 × macro mAP + 0.4 
 
 mAP is COCO-style, IoU 0.50 to 0.95, mean over all 26 foods. QWK is mean over the 10 Group A foods, and only on boxes that already match the right food at IoU ≥ 0.5. Grades are ordered: 0 fresh, 1 semi-fresh, 2 spoiled. A two-step miss counts four times a one-step miss.
 
-1. **YOLO11m** (Jocher and Qiu, Ultralytics, 2024) for the box and the food type. COCO-pretrained, 20.1M parameters, trained at 1280. Images that contain a food with fewer than 40 boxes are repeated so the macro average cannot ignore beef, chicken, lamb, pork, and salmon. No extra images.
+1. **YOLO11m** (Jocher and Qiu, Ultralytics, 2024) for the box and the food type. COCO-pretrained, 20.1M parameters, trained at 1280. An image is repeated when its rarest food has fewer than 100 boxes, up to 8 times, so avocado, tomato, and the meats are not drowned by strawberry. No extra images.
 
 2. **CORAL** (Cao, Mirjalili, Raschka, 2019, [arXiv:1901.07884](https://arxiv.org/abs/1901.07884)) for freshness. A MobileNetV3-Small crop encoder plus two shared-weight thresholds. Group B stays `freshness_grade: null`.
 

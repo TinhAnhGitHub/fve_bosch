@@ -25,7 +25,7 @@ YOLO = DATA / "yolo"
 OUT = ROOT / "baselines" / "out" / "fresh"
 SUB = ROOT / "submissions" / "fresh" / "preds.json"
 IMGSZ = 1280
-RARE_BOXES = 40
+RARE_BOXES = 100
 GROUP_A = {
     "blueberry", "cherry", "grape", "lychee", "strawberry",
     "beef", "chicken", "lamb", "pork", "salmon",
@@ -76,7 +76,8 @@ def prep() -> None:
         if not src.is_file():
             raise SystemExit(f"missing image {im['file_name']}")
         objs = boxes[im["id"]]
-        reps = 4 if any(obj["category_id"] in rare for obj in objs) else 1
+        worst = min((counts[obj["category_id"]] for obj in objs), default=999)
+        reps = 1 if worst >= RARE_BOXES else min(8, max(2, RARE_BOXES // worst))
         for rep in range(reps):
             stem = src.stem if rep == 0 else f"{src.stem}__{rep}"
             dst = YOLO / "images" / "train" / f"{stem}{src.suffix}"
@@ -126,8 +127,8 @@ def train_det() -> None:
     model = YOLO("yolo11m.pt")
     model.train(
         data=str(YOLO / "data.yaml"),
-        epochs=80,
-        patience=20,
+        epochs=60,
+        patience=60,
         imgsz=IMGSZ,
         batch=8 if gpu else 2,
         device=0 if gpu else "cpu",
@@ -309,7 +310,7 @@ def predict() -> None:
     meta = json.loads((OUT / "meta.json").read_text())
     group_a = set(meta["group_a"])
     ids = meta["ids"]
-    det = YOLO(str(next((OUT / "det").rglob("best.pt"))))
+    det = YOLO(str(next((OUT / "det").rglob("last.pt"))))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net, head, bias = _load_coral(device)
     tf = _Crops([], False).tf
