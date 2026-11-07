@@ -185,12 +185,12 @@ class _Crops:
         return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
+def _crop(im, bbox, pad: float = 0.6, jitter: bool = False):
     import random
 
     x, y, w, h = [float(v) for v in bbox]
     if jitter:
-        pad = random.uniform(0.0, 0.2)
+        pad = random.uniform(0.3, 0.9)
         x += random.uniform(-0.08, 0.08) * w
         y += random.uniform(-0.08, 0.08) * h
     box = (
