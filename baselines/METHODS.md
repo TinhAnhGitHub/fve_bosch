@@ -12,11 +12,12 @@ Three published methods fit this setting.
    loss sees shape and size and not the arbitrary scan pose. Command:
    `uv run baselines/baseline.py train`.
 
-2. **Category template + image scale** (`baselines/atlas.py`). A frozen DINOv2
-   ViT-B/14 reads the image. One learned millimetre cloud per category starts
-   from the median-sized training sample. The image adds a rank-32 offset and
-   a bounded scale. That cloud is not a mesh retrieved by appearance. The
-   checkpoint is the best holdout epoch. ViT-B/14 at 224 fits an L4.
+2. **AtlasNet** (Groueix et al., CVPR 2018), which is what `baselines/atlas.py`
+   trains. A frozen DINOv2 ViT-B/14 reads the image. Each of the 8192 output
+   points attends to the patch tokens, then a small MLP maps that vector to
+   millimetres. A learned category vector is added to the query. It is not a
+   retrieved mesh. The checkpoint is the best holdout epoch. ViT-B/14 at 224
+   fits an L4.
 
 3. **Arbitrary-scale mesh, then a learned volume scale** (Gao, Coburn, Raghavan, He,
    Zhu, "Size Matters", 2026). One-2-3-45 reconstructs a mesh in unknown units from one
