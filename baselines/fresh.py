@@ -200,6 +200,76 @@ def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
     return im.crop(box)
 
 
+def _iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1, y1 = max(ax, bx), max(ay, by)
+    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union else 0.0
+
+
+def matched_crops() -> list:
+    """Detector boxes that land on a Group A label. QWK only scores those."""
+    weights = next((OUT / "det").rglob("last.pt"), None)
+    if weights is None:
+        return []
+    from ultralytics import YOLO
+
+    meta = json.loads((OUT / "meta.json").read_text())
+    ids = meta["ids"]
+    group_a = set(meta["group_a"])
+    ann = json.loads((find_dir("train") / "annotations.json").read_text())
+    by_id = {im["id"]: im for im in ann["images"]}
+    by_image: dict = {}
+    for obj in ann["annotations"]:
+        if obj["category_id"] in group_a and obj.get("freshness_grade") is not None:
+            by_image.setdefault(obj["image_id"], []).append(obj)
+    train = find_dir("train")
+    paths, image_ids = [], []
+    for iid in by_image:
+        im = by_id[iid]
+        src = train / "images" / im["file_name"]
+        if not src.is_file():
+            src = train / im["file_name"]
+        if src.is_file():
+            paths.append(src)
+            image_ids.append(iid)
+    det = YOLO(str(weights))
+    samples = []
+    for start in range(0, len(paths), 8):
+        chunk_p = paths[start : start + 8]
+        chunk_i = image_ids[start : start + 8]
+        results = det.predict([str(p) for p in chunk_p], imgsz=IMGSZ, conf=0.05, iou=0.7, max_det=300, verbose=False)
+        for path, iid, result in zip(chunk_p, chunk_i, results):
+            if result.boxes is None:
+                continue
+            preds = []
+            xyxy = result.boxes.xyxy.cpu().numpy()
+            cls = result.boxes.cls.cpu().numpy().astype(int)
+            for (x1, y1, x2, y2), k in zip(xyxy, cls):
+                if (x2 - x1) < 1 or (y2 - y1) < 1:
+                    continue
+                preds.append((ids[int(k)], (float(x1), float(y1), float(x2 - x1), float(y2 - y1))))
+            used = set()
+            for obj in by_image[iid]:
+                best_i, best_u = -1, 0.5
+                for i, (cat, box) in enumerate(preds):
+                    if i in used or cat != obj["category_id"]:
+                        continue
+                    u = _iou(box, obj["bbox"])
+                    if u >= best_u:
+                        best_i, best_u = i, u
+                if best_i < 0:
+                    continue
+                used.add(best_i)
+                cat, box = preds[best_i]
+                samples.append((path, box, int(obj["freshness_grade"]), cat, iid))
+    print(f"matched {len(samples)} detector crops", flush=True)
+    return samples
+
+
 def train_fresh() -> None:
     import torch
     import torch.nn.functional as F
@@ -209,7 +279,7 @@ def train_fresh() -> None:
 
     meta = json.loads((OUT / "meta.json").read_text())
     hold = set(meta["holdout"])
-    samples = group_a_crops()
+    samples = group_a_crops() + matched_crops()
     train_samples = [s for s in samples if s[4] not in hold]
     val_samples = [s for s in samples if s[4] in hold]
     if not train_samples:
@@ -222,10 +292,16 @@ def train_fresh() -> None:
     net = net.to(device)
     head = torch.nn.Linear(dim, 1, bias=False).to(device)
     bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
+    warm = (OUT / "coral.pt").is_file()
+    if warm:
+        blob = torch.load(OUT / "coral.pt", map_location=device, weights_only=True)
+        net.load_state_dict(blob["net"])
+        head.weight.data.copy_(blob["head"].to(device))
+        bias.data.copy_(blob["bias"].to(device))
     opt = torch.optim.AdamW(
         [
-            {"params": net.parameters(), "lr": 1e-4},
-            {"params": [head.weight, bias], "lr": 1e-3},
+            {"params": net.parameters(), "lr": 1e-5 if warm else 1e-4},
+            {"params": [head.weight, bias], "lr": 1e-4 if warm else 1e-3},
         ],
         weight_decay=1e-4,
     )
@@ -234,7 +310,7 @@ def train_fresh() -> None:
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
     state = None
-    for epoch in range(1, 31):
+    for epoch in range(1, 16 if warm else 31):
         net.train()
         total, seen = 0.0, 0
         for x, y, k in loader:
