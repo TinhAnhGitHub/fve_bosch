@@ -1,0 +1,14 @@
+[project]
+name = "fve-bosch"
+version = "0.1.0"
+description = "Food 3D Reconstruction baseline"
+readme = "README.md"
+authors = [
+    { name = "Nguyen Nhu Tinh Anh (SX/EIT-MM-TM-AI)", email = "Anh.NguyenNhuTinh@vn.bosch.com" }
+]
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.13.4,<0.14.0"]
+build-backend = "uv_build"
