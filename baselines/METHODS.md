@@ -15,8 +15,9 @@ Three published methods fit this setting.
 2. **AtlasNet** (Groueix et al., CVPR 2018), which is what `baselines/atlas.py`
    trains. A frozen DINOv2 ViT-B/14 reads the image. A decoder folds eight grids
    onto the surface, 8192 points, and the loss is the challenge CD-L2 in the
-   canonical millimetre frame. The category folder is a learned vector, not a
-   retrieved mesh. ViT-B/14 at 224 fits an L4.
+   canonical millimetre frame. The image code is a 64-d bottleneck added to a
+   learned category vector, not a retrieved mesh. The checkpoint is the best
+   holdout epoch. ViT-B/14 at 224 fits an L4.
 
 3. **Arbitrary-scale mesh, then a learned volume scale** (Gao, Coburn, Raghavan, He,
    Zhu, "Size Matters", 2026). One-2-3-45 reconstructs a mesh in unknown units from one

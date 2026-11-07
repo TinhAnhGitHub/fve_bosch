@@ -5,12 +5,11 @@
 """AtlasNet baseline for Food 3D Reconstruction.
 
 Groueix et al., CVPR 2018: a decoder folds a 2D grid onto the surface.
-The image code is a frozen DINOv2 ViT-B/14 (Oquab et al., 2023). Targets are
-the canonical millimetre clouds from geom.py, so the Chamfer loss supervises
-shape and size and ignores the arbitrary scan pose.
-
-The category folder is part of the released split, so the decoder also sees a
-learned category vector. That is not a retrieved training mesh.
+The image code is a frozen DINOv2 ViT-B/14 (Oquab et al., 2023), squeezed to
+64 dimensions and added to a learned category vector. Targets are the
+canonical millimetre clouds from geom.py, so the Chamfer loss supervises
+shape and size and ignores the arbitrary scan pose. The category vector is
+not a retrieved training mesh.
 
   uv run baselines/atlas.py cache
   uv run baselines/atlas.py train
@@ -110,7 +109,11 @@ def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32)
 
 
 class Atlas(nn.Module):
-    """Fold PATCHES grids into one millimetre point cloud of N points."""
+    """Fold PATCHES grids into one millimetre point cloud of N points.
+
+    The image code is a 64-d bottleneck added to the category code. The raw
+    768-d vector memorised the training clouds (train CD ~90, public CD 733).
+    """
 
     def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES) -> None:
         super().__init__()
@@ -120,10 +123,13 @@ class Atlas(nn.Module):
         axis = torch.linspace(-1.0, 1.0, g)
         yy, xx = torch.meshgrid(axis, axis, indexing="ij")
         self.register_buffer("grid", torch.stack([xx, yy], -1).reshape(-1, 2))
-        self.cat = nn.Embedding(n_cat, 32)
+        self.cat = nn.Embedding(n_cat, 64)
+        self.img = nn.Linear(dim, 64)
+        nn.init.normal_(self.img.weight, std=0.01)
+        nn.init.zeros_(self.img.bias)
         self.patch = nn.Parameter(torch.randn(patches, 16) * 0.02)
         self.mlp = nn.Sequential(
-            nn.Linear(dim + 32 + 16 + 2, 512),
+            nn.Linear(64 + 16 + 2, 512),
             nn.ReLU(),
             nn.Linear(512, 512),
             nn.ReLU(),
@@ -131,10 +137,10 @@ class Atlas(nn.Module):
         )
 
     def forward(self, feat: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
-        b, p, g = feat.shape[0], self.patch.shape[0], self.grid.shape[0]
+        code = self.cat(cat) + self.img(feat)
+        b, p, g = code.shape[0], self.patch.shape[0], self.grid.shape[0]
         parts = [
-            feat[:, None, None, :].expand(b, p, g, -1),
-            self.cat(cat)[:, None, None, :].expand(b, p, g, -1),
+            code[:, None, None, :].expand(b, p, g, -1),
             self.patch[None, :, None, :].expand(b, p, g, -1),
             self.grid[None, None].expand(b, p, g, -1),
         ]
@@ -204,9 +210,10 @@ def train() -> None:
     cut = max(1, int(len(order) * 0.1))
     val, tr = order[:cut], order[cut:]
     net = Atlas(feats.shape[1], len(vocab)).to(dev)
-    opt = torch.optim.AdamW(net.parameters(), lr=1e-3)
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
     batch = 4 if dev.type == "cuda" else 2
-    for epoch in range(1, 41):
+    best, best_score = None, float("inf")
+    for epoch in range(1, 61):
         net.train()
         rng.shuffle(tr)
         total = 0.0
@@ -217,19 +224,23 @@ def train() -> None:
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total += float(loss) * len(b)
+            total += float(loss.detach()) * len(b)
             seen += len(b)
         net.eval()
         vtotal, vseen = 0.0, 0
         with torch.inference_mode():
             for i in range(0, len(val), batch):
                 b = val[i : i + batch]
-                vtotal += float(cd_l2(net(feats[b].to(dev), cat[b].to(dev)), pts[b].to(dev))) * len(b)
+                vtotal += float(cd_l2(net(feats[b].to(dev), cat[b].to(dev)), pts[b].to(dev), k=8192)) * len(b)
                 vseen += len(b)
-        print(f"epoch {epoch}  train {total / seen:.1f}  holdout {vtotal / vseen:.1f}", flush=True)
+        score = vtotal / vseen
+        if score < best_score:
+            best_score = score
+            best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+        print(f"epoch {epoch}  train {total / seen:.1f}  holdout {score:.1f}", flush=True)
     OUT.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": net.state_dict(), "vocab": vocab, "dim": feats.shape[1]}, CKPT)
-    print(f"saved {CKPT}")
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[1]}, CKPT)
+    print(f"saved {CKPT}  holdout {best_score:.1f}")
 
 
 def predict() -> None:
