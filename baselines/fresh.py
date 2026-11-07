@@ -164,7 +164,11 @@ class _Crops:
     def __init__(self, samples, train: bool):
         from torchvision import transforms
 
-        jitter = [transforms.Resize((224, 224)), transforms.RandomHorizontalFlip()] if train else [transforms.Resize((224, 224))]
+        jitter = [
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.3),
+        ] if train else [transforms.Resize((224, 224))]
         self.tf = transforms.Compose(
             jitter
             + [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
@@ -489,7 +493,7 @@ def _matched(image_ids, by_image):
     return boxes
 
 
-def _score_boxes(net, head, bias, boxes, device) -> float:
+def _score_boxes(net, head, bias, boxes, device):
     import numpy as np
     import torch
 
@@ -498,15 +502,19 @@ def _score_boxes(net, head, bias, boxes, device) -> float:
     k = torch.tensor([b[2] - 1 for b in boxes], device=device)
     with torch.no_grad():
         grade = (torch.sigmoid(head(net(x)) + bias[k]) > 0.5).sum(1).cpu().numpy()
-    scores = []
+    scores, parts = [], []
     cats = np.asarray([b[2] for b in boxes])
     true = np.asarray([b[1] for b in boxes])
     for cat in range(1, 11):
         m = cats == cat
         if int(m.sum()) < 2:
+            parts.append(f"{cat}:.")
             continue
-        scores.append(_qwk(true[m], grade[m]))
-    return float(sum(scores) / len(scores)) if scores else 0.0
+        q = _qwk(true[m], grade[m])
+        scores.append(q)
+        parts.append(f"{cat}:{q:.2f}")
+    macro = float(sum(scores) / len(scores)) if scores else 0.0
+    return macro, " ".join(parts)
 
 
 def cv() -> None:
@@ -538,6 +546,12 @@ def cv() -> None:
     print("hold", len(hold), "matched", len(boxes), Counter(b[2] for b in boxes), flush=True)
     if len(boxes) < 10:
         raise SystemExit("holdout has too few matched boxes")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if (OUT / "coral.pt").exists():
+        old_net, old_head, old_bias = _load_coral(device)
+        old_score, old_detail = _score_boxes(old_net, old_head, old_bias, boxes, device)
+        print(f"current cv_qwk {old_score:.4f} {old_detail}", flush=True)
+        del old_net, old_head, old_bias
     train_samples = [s for s in samples if s[4] not in hold]
     net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
     dim = net.classifier[0].in_features
@@ -572,7 +586,7 @@ def cv() -> None:
             opt.step()
             total += float(loss.detach()) * len(y)
             seen += len(y)
-        score = _score_boxes(net, head, bias, boxes, device)
+        score, detail = _score_boxes(net, head, bias, boxes, device)
         mark = ""
         if score > best:
             best = score
@@ -585,7 +599,7 @@ def cv() -> None:
                 },
                 OUT / "coral.pt",
             )
-        print(f"epoch {epoch} loss {total / seen:.4f} cv_qwk {score:.4f}{mark}", flush=True)
+        print(f"epoch {epoch} loss {total / seen:.4f} cv_qwk {score:.4f} {detail}{mark}", flush=True)
     print(f"best cv_qwk {best:.4f}", flush=True)
 
 
