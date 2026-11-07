@@ -210,11 +210,10 @@ def train_fresh() -> None:
     net = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
     dim = net.classifier[0].in_features
     net.classifier = torch.nn.Identity()
-    head = torch.nn.Linear(dim, 1, bias=False)
-    bias = torch.nn.Parameter(torch.zeros(2))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net, head = net.to(device), head.to(device)
-    bias = bias.to(device)
+    net = net.to(device)
+    head = torch.nn.Linear(dim, 1, bias=False).to(device)
+    bias = torch.nn.Parameter(torch.zeros(2, device=device))
     opt = torch.optim.AdamW(
         [
             {"params": net.parameters(), "lr": 1e-4},
