@@ -130,7 +130,7 @@ def train_det() -> None:
         epochs=60,
         patience=60,
         imgsz=IMGSZ,
-        batch=8 if gpu else 2,
+        batch=4 if gpu else 2,
         device=0 if gpu else "cpu",
         workers=2 if gpu else 0,
         project=str(OUT),
