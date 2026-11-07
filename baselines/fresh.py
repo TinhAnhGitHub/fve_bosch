@@ -121,10 +121,10 @@ def prep() -> None:
 
 def train_det() -> None:
     import torch
-    from ultralytics import YOLO
+    from ultralytics import YOLO as Detector
 
     gpu = torch.cuda.is_available()
-    model = YOLO("yolo11m.pt")
+    model = Detector("yolo11m.pt")
     model.train(
         data=str(YOLO / "data.yaml"),
         epochs=60,
