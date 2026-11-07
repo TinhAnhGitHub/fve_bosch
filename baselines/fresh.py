@@ -170,6 +170,7 @@ class _Crops:
             + [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
         )
         self.samples = samples
+        self.train = train
 
     def __len__(self):
         return len(self.samples)
@@ -177,13 +178,19 @@ class _Crops:
     def __getitem__(self, i):
         from PIL import Image
 
-        path, bbox, grade = self.samples[i][:3]
+        path, bbox, grade, cat = self.samples[i][:4]
         im = Image.open(path).convert("RGB")
-        return self.tf(_crop(im, bbox)), grade
+        return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.1):
-    x, y, w, h = bbox
+def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
+    import random
+
+    x, y, w, h = [float(v) for v in bbox]
+    if jitter:
+        pad = random.uniform(0.0, 0.2)
+        x += random.uniform(-0.08, 0.08) * w
+        y += random.uniform(-0.08, 0.08) * h
     box = (
         max(0, int(x - pad * w)),
         max(0, int(y - pad * h)),
@@ -196,7 +203,8 @@ def _crop(im, bbox, pad: float = 0.1):
 def train_fresh() -> None:
     import torch
     import torch.nn.functional as F
-    from torch.utils.data import DataLoader
+    from collections import Counter
+    from torch.utils.data import DataLoader, WeightedRandomSampler
     from torchvision import models
 
     meta = json.loads((OUT / "meta.json").read_text())
@@ -213,7 +221,7 @@ def train_fresh() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
     head = torch.nn.Linear(dim, 1, bias=False).to(device)
-    bias = torch.nn.Parameter(torch.zeros(2, device=device))
+    bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
     opt = torch.optim.AdamW(
         [
             {"params": net.parameters(), "lr": 1e-4},
@@ -221,31 +229,33 @@ def train_fresh() -> None:
         ],
         weight_decay=1e-4,
     )
-    loader = DataLoader(_Crops(train_samples, True), batch_size=32, shuffle=True, num_workers=0)
-    best, best_score = None, -1.0
-    for epoch in range(1, 21):
+    counts = Counter((s[3], s[2]) for s in train_samples)
+    weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
+    state = None
+    for epoch in range(1, 31):
         net.train()
-        total = 0.0
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logit = head(net(x)) + bias
+        total, seen = 0.0, 0
+        for x, y, k in loader:
+            x, y, k = x.to(device), y.to(device), k.to(device)
+            logit = head(net(x)) + bias[k]
             target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
             loss = F.binary_cross_entropy_with_logits(logit, target)
             opt.zero_grad()
             loss.backward()
             opt.step()
             total += float(loss.detach()) * len(y)
+            seen += len(y)
         score = _holdout_qwk(net, head, bias, val_samples, device)
-        print(f"epoch {epoch} loss {total / len(train_samples):.4f} holdout_qwk {score:.4f}", flush=True)
-        if score >= best_score:
-            best_score = score
-            best = {
-                "net": {k: v.detach().cpu() for k, v in net.state_dict().items()},
-                "head": head.weight.detach().cpu(),
-                "bias": bias.detach().cpu(),
-            }
-    torch.save(best, OUT / "coral.pt")
-    print(f"saved {OUT / 'coral.pt'} qwk {best_score:.4f}")
+        print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {score:.4f}", flush=True)
+        state = {
+            "net": {k: v.detach().cpu() for k, v in net.state_dict().items()},
+            "head": head.weight.detach().cpu(),
+            "bias": bias.detach().cpu(),
+        }
+    torch.save(state, OUT / "coral.pt")
+    print(f"saved {OUT / 'coral.pt'} qwk {score:.4f}")
 
 
 def _holdout_qwk(net, head, bias, samples, device) -> float:
@@ -259,8 +269,8 @@ def _holdout_qwk(net, head, bias, samples, device) -> float:
     preds, trues, cats = [], [], []
     with torch.no_grad():
         for i, sample in enumerate(samples):
-            x, _grade = loader[i]
-            grade_hat = int((torch.sigmoid(head(net(x[None].to(device))) + bias) > 0.5).sum())
+            x, _grade, k = loader[i]
+            grade_hat = int((torch.sigmoid(head(net(x[None].to(device))) + bias[k]) > 0.5).sum())
             preds.append(grade_hat)
             trues.append(sample[2])
             cats.append(sample[3])
@@ -329,6 +339,8 @@ def predict() -> None:
         cls = result.boxes.cls.cpu().numpy().astype(int)
         conf = result.boxes.conf.cpu().numpy()
         for (x1, y1, x2, y2), k, score in zip(xyxy, cls, conf):
+            if (x2 - x1) < 1 or (y2 - y1) < 1:
+                continue
             cat = ids[int(k)]
             row = {
                 "image_id": int(path.stem),
@@ -339,7 +351,7 @@ def predict() -> None:
             if cat in group_a:
                 x = tf(_crop(im, (x1, y1, x2 - x1, y2 - y1)))
                 with torch.no_grad():
-                    prob = torch.sigmoid(head(net(x[None].to(device))) + bias)[0]
+                    prob = torch.sigmoid(head(net(x[None].to(device))) + bias[cat - 1])[0]
                 grade = int((prob > 0.5).sum())
                 masses = (1 - prob[0], prob[0] - prob[1], prob[1])
                 row["freshness_grade"] = grade
