@@ -8,6 +8,8 @@ Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
 arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
 two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
 a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
+Each food has its own weights on the crop color: bloom on a berry and redness
+on meat do not point the same way.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -220,12 +222,13 @@ def train_fresh() -> None:
     net.classifier = torch.nn.Identity()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
-    head = torch.nn.Linear(dim + 6, 1, bias=False).to(device)
+    head = torch.nn.Linear(dim, 1, bias=False).to(device)
+    color = torch.nn.Parameter(torch.zeros(10, 6, device=device))
     bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
     opt = torch.optim.AdamW(
         [
             {"params": net.parameters(), "lr": 1e-4},
-            {"params": [head.weight, bias], "lr": 1e-3},
+            {"params": [head.weight, color, bias], "lr": 1e-3},
         ],
         weight_decay=1e-4,
     )
@@ -239,7 +242,7 @@ def train_fresh() -> None:
         total, seen = 0.0, 0
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
-            logit = head(_feat(net, x)) + bias[k]
+            logit = _logit(net, head, color, bias, x, k)
             target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
             loss = F.binary_cross_entropy_with_logits(logit, target)
             opt.zero_grad()
@@ -247,18 +250,19 @@ def train_fresh() -> None:
             opt.step()
             total += float(loss.detach()) * len(y)
             seen += len(y)
-        score = _holdout_qwk(net, head, bias, val_samples, device)
+        score = _holdout_qwk(net, head, color, bias, val_samples, device)
         print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {score:.4f}", flush=True)
         state = {
             "net": {k: v.detach().cpu() for k, v in net.state_dict().items()},
             "head": head.weight.detach().cpu(),
+            "color": color.detach().cpu(),
             "bias": bias.detach().cpu(),
         }
     torch.save(state, OUT / "coral.pt")
     print(f"saved {OUT / 'coral.pt'} qwk {score:.4f}")
 
 
-def _holdout_qwk(net, head, bias, samples, device) -> float:
+def _holdout_qwk(net, head, color, bias, samples, device) -> float:
     if len(samples) < 2:
         return 0.0
     import numpy as np
@@ -270,7 +274,7 @@ def _holdout_qwk(net, head, bias, samples, device) -> float:
     with torch.no_grad():
         for i, sample in enumerate(samples):
             x, _grade, k = loader[i]
-            grade_hat = int((torch.sigmoid(head(_feat(net, x[None].to(device))) + bias[k]) > 0.5).sum())
+            grade_hat = int((torch.sigmoid(_logit(net, head, color, bias, x[None].to(device), k)) > 0.5).sum())
             preds.append(grade_hat)
             trues.append(sample[2])
             cats.append(sample[3])
@@ -298,7 +302,7 @@ def _qwk(y_true, y_pred, n: int = 3) -> float:
     return 1.0 if den == 0 else float(1 - (w * o).sum() / den)
 
 
-def _feat(net, x):
+def _color(x):
     import torch
 
     mean = torch.tensor([0.485, 0.456, 0.406], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
@@ -307,8 +311,18 @@ def _feat(net, x):
     h = raw.shape[-2] // 4
     center = raw[:, :, h : 3 * h, h : 3 * h]
     flat = center.flatten(2)
-    color = torch.cat([torch.quantile(flat, 0.2, dim=2), torch.quantile(flat, 0.8, dim=2)], 1)
-    return torch.cat([net(x), color], 1)
+    return torch.cat([torch.quantile(flat, 0.2, dim=2), torch.quantile(flat, 0.8, dim=2)], 1)
+
+
+def _logit(net, head, color, bias, x, k):
+    import torch
+
+    index = k if torch.is_tensor(k) else torch.tensor(k, device=x.device)
+    cw = color[index]
+    if cw.dim() == 1:
+        cw = cw.view(1, -1)
+    extra = (cw * _color(x)).sum(1, keepdim=True)
+    return head(net(x)) + extra + bias[index]
 
 
 def _load_coral(device):
@@ -316,12 +330,14 @@ def _load_coral(device):
     from torchvision import models
 
     blob = torch.load(OUT / "coral.pt", map_location=device, weights_only=True)
+    if "color" not in blob:
+        raise RuntimeError("old head")
     net = models.mobilenet_v3_large(weights=None)
     net.classifier = torch.nn.Identity()
     net.load_state_dict(blob["net"])
     head = torch.nn.Linear(blob["head"].shape[1], 1, bias=False)
     head.weight.data.copy_(blob["head"])
-    return net.to(device).eval(), head.to(device).eval(), blob["bias"].to(device)
+    return net.to(device).eval(), head.to(device).eval(), blob["color"].to(device), blob["bias"].to(device)
 
 
 def _iou(a, b) -> float:
@@ -396,7 +412,7 @@ def fit() -> None:
             images.append((im["id"], src))
     det = YOLO(str(next((OUT / "det").rglob("last.pt"))))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net, head, bias = _load_coral(device)
+    net, head, color, bias = _load_coral(device)
     tf = _Crops([], False).tf
     pairs = []
     for start in range(0, len(images), 16):
@@ -426,7 +442,7 @@ def fit() -> None:
                     continue
                 x = tf(_crop(im, (float(x1), float(y1), float(x2 - x1), float(y2 - y1))))
                 with torch.no_grad():
-                    prob = torch.sigmoid(head(_feat(net, x[None].to(device))) + bias[cat - 1])[0]
+                    prob = torch.sigmoid(_logit(net, head, color, bias, x[None].to(device), cat - 1))[0]
                 preds.append((float(score), cat, [float(x1), float(y1), float(x2 - x1), float(y2 - y1)], float(prob[0]), float(prob[1])))
             used = set()
             for _score, cat, box, p0, p1 in sorted(preds, key=lambda r: -r[0]):
@@ -502,7 +518,7 @@ def _matched(image_ids, by_image):
     return boxes
 
 
-def _score_boxes(net, head, bias, boxes, device):
+def _score_boxes(net, head, color, bias, boxes, device):
     import numpy as np
     import torch
 
@@ -510,7 +526,7 @@ def _score_boxes(net, head, bias, boxes, device):
     x = torch.stack([b[0] for b in boxes]).to(device)
     k = torch.tensor([b[2] - 1 for b in boxes], device=device)
     with torch.no_grad():
-        grade = (torch.sigmoid(head(_feat(net, x)) + bias[k]) > 0.5).sum(1).cpu().numpy()
+        grade = (torch.sigmoid(_logit(net, head, color, bias, x, k)) > 0.5).sum(1).cpu().numpy()
     scores, parts = [], []
     cats = np.asarray([b[2] for b in boxes])
     true = np.asarray([b[1] for b in boxes])
@@ -522,6 +538,9 @@ def _score_boxes(net, head, bias, boxes, device):
         q = _qwk(true[m], grade[m])
         scores.append(q)
         parts.append(f"{cat}:{q:.2f}")
+    gap = np.abs(true.astype(int) - grade.astype(int))
+    bad = int((gap > 0).sum())
+    parts.append(f"two:{int((gap == 2).sum())}/{bad}")
     macro = float(sum(scores) / len(scores)) if scores else 0.0
     return macro, " ".join(parts)
 
@@ -558,10 +577,10 @@ def cv() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if (OUT / "coral.pt").exists():
         try:
-            old_net, old_head, old_bias = _load_coral(device)
-            old_score, old_detail = _score_boxes(old_net, old_head, old_bias, boxes, device)
+            old_net, old_head, old_color, old_bias = _load_coral(device)
+            old_score, old_detail = _score_boxes(old_net, old_head, old_color, old_bias, boxes, device)
             print(f"current cv_qwk {old_score:.4f} {old_detail}", flush=True)
-            del old_net, old_head, old_bias
+            del old_net, old_head, old_color, old_bias
         except Exception as exc:
             print("current skipped", type(exc).__name__, flush=True)
     train_samples = [s for s in samples if s[4] not in hold]
@@ -570,12 +589,13 @@ def cv() -> None:
     net.classifier = torch.nn.Identity()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
-    head = torch.nn.Linear(dim + 6, 1, bias=False).to(device)
+    head = torch.nn.Linear(dim, 1, bias=False).to(device)
+    color = torch.nn.Parameter(torch.zeros(10, 6, device=device))
     bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
     opt = torch.optim.AdamW(
         [
             {"params": net.parameters(), "lr": 1e-4},
-            {"params": [head.weight, bias], "lr": 1e-3},
+            {"params": [head.weight, color, bias], "lr": 1e-3},
         ],
         weight_decay=1e-4,
     )
@@ -590,7 +610,7 @@ def cv() -> None:
         total, seen = 0.0, 0
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
-            logit = head(_feat(net, x)) + bias[k]
+            logit = _logit(net, head, color, bias, x, k)
             target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
             loss = F.binary_cross_entropy_with_logits(logit, target)
             opt.zero_grad()
@@ -598,7 +618,7 @@ def cv() -> None:
             opt.step()
             total += float(loss.detach()) * len(y)
             seen += len(y)
-        score, detail = _score_boxes(net, head, bias, boxes, device)
+        score, detail = _score_boxes(net, head, color, bias, boxes, device)
         mark = ""
         if score > best:
             best = score
@@ -607,6 +627,7 @@ def cv() -> None:
                 {
                     "net": {k: v.detach().cpu() for k, v in net.state_dict().items()},
                     "head": head.weight.detach().cpu(),
+                    "color": color.detach().cpu(),
                     "bias": bias.detach().cpu(),
                 },
                 OUT / "coral.pt",
@@ -625,7 +646,7 @@ def predict() -> None:
     ids = meta["ids"]
     det = YOLO(str(next((OUT / "det").rglob("last.pt"))))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    net, head, bias = _load_coral(device)
+    net, head, color, bias = _load_coral(device)
     tf = _Crops([], False).tf
     try:
         images = find_dir("eval") / "images"
@@ -655,7 +676,7 @@ def predict() -> None:
             if cat in group_a:
                 x = tf(_crop(im, (x1, y1, x2 - x1, y2 - y1)))
                 with torch.no_grad():
-                    prob = torch.sigmoid(head(_feat(net, x[None].to(device))) + bias[cat - 1])[0]
+                    prob = torch.sigmoid(_logit(net, head, color, bias, x[None].to(device), cat - 1))[0]
                 row["_p"] = (float(prob[0]), float(prob[1]))
             else:
                 row["freshness_grade"] = None
