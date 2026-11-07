@@ -311,6 +311,134 @@ def _load_coral(device):
     return net.to(device).eval(), head.to(device).eval(), blob["bias"].to(device)
 
 
+def _iou(a, b) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    x1, y1 = max(ax, bx), max(ay, by)
+    x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = aw * ah + bw * bh - inter
+    return inter / union if union else 0.0
+
+
+def _grade(p0: float, p1: float, t0: float, t1: float) -> int:
+    return int(p0 > t0) + int(p1 > t1)
+
+
+def _macro(rows, thresh) -> float:
+    import numpy as np
+
+    scores = []
+    for cat in range(1, 11):
+        sub = [r for r in rows if r[1] == cat]
+        if len(sub) < 2:
+            continue
+        yt = np.asarray([r[2] for r in sub])
+        yp = np.asarray([_grade(r[3], r[4], *thresh[cat]) for r in sub])
+        scores.append(_qwk(yt, yp))
+    return float(sum(scores) / len(scores)) if scores else 0.0
+
+
+def _search(rows):
+    import numpy as np
+
+    grid = (0.3, 0.4, 0.5, 0.6, 0.7)
+    thresh = {}
+    for cat in range(1, 11):
+        sub = [r for r in rows if r[1] == cat]
+        best = (0.5, 0.5)
+        if len(sub) >= 8:
+            yt = np.asarray([r[2] for r in sub])
+            best_s = _qwk(yt, np.asarray([_grade(r[3], r[4], *best) for r in sub]))
+            for t0 in grid:
+                for t1 in grid:
+                    s = _qwk(yt, np.asarray([_grade(r[3], r[4], t0, t1) for r in sub]))
+                    if s > best_s:
+                        best, best_s = (t0, t1), s
+            print(f"class {cat} n {len(sub)} thresh {best} qwk {best_s:.3f}", flush=True)
+        thresh[cat] = best
+    return thresh
+
+
+def fit() -> None:
+    import torch
+    from PIL import Image
+    from ultralytics import YOLO
+
+    meta = json.loads((OUT / "meta.json").read_text())
+    group_a = set(meta["group_a"])
+    ids = meta["ids"]
+    train = find_dir("train")
+    ann = json.loads((train / "annotations.json").read_text())
+    gt = {}
+    for obj in ann["annotations"]:
+        if obj["category_id"] in group_a and obj.get("freshness_grade") is not None:
+            gt.setdefault(obj["image_id"], []).append(obj)
+    images = []
+    for im in ann["images"]:
+        src = train / "images" / im["file_name"]
+        if not src.is_file():
+            src = train / im["file_name"]
+        if src.is_file() and im["id"] in gt:
+            images.append((im["id"], src))
+    det = YOLO(str(next((OUT / "det").rglob("last.pt"))))
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net, head, bias = _load_coral(device)
+    tf = _Crops([], False).tf
+    pairs = []
+    for start in range(0, len(images), 16):
+        chunk = images[start : start + 16]
+        results = det.predict(
+            [str(p) for _, p in chunk],
+            imgsz=IMGSZ,
+            conf=0.001,
+            iou=0.7,
+            max_det=300,
+            batch=4,
+            verbose=False,
+        )
+        for (image_id, path), result in zip(chunk, results):
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+            im = Image.open(path).convert("RGB")
+            preds = []
+            xyxy = result.boxes.xyxy.cpu().numpy()
+            cls = result.boxes.cls.cpu().numpy().astype(int)
+            conf = result.boxes.conf.cpu().numpy()
+            for (x1, y1, x2, y2), k, score in zip(xyxy, cls, conf):
+                if (x2 - x1) < 1 or (y2 - y1) < 1:
+                    continue
+                cat = ids[int(k)]
+                if cat not in group_a:
+                    continue
+                x = tf(_crop(im, (float(x1), float(y1), float(x2 - x1), float(y2 - y1))))
+                with torch.no_grad():
+                    prob = torch.sigmoid(head(net(x[None].to(device))) + bias[cat - 1])[0]
+                preds.append((float(score), cat, [float(x1), float(y1), float(x2 - x1), float(y2 - y1)], float(prob[0]), float(prob[1])))
+            used = set()
+            for _score, cat, box, p0, p1 in sorted(preds, key=lambda r: -r[0]):
+                best_i, best_u = None, 0.5
+                for i, obj in enumerate(gt[image_id]):
+                    if i in used or obj["category_id"] != cat:
+                        continue
+                    u = _iou(box, obj["bbox"])
+                    if u >= best_u:
+                        best_i, best_u = i, u
+                if best_i is None:
+                    continue
+                used.add(best_i)
+                pairs.append((image_id, cat, int(gt[image_id][best_i]["freshness_grade"]), p0, p1))
+        print(f"fit {start + len(chunk)}/{len(images)} matched {len(pairs)}", flush=True)
+    base = {c: (0.5, 0.5) for c in range(1, 11)}
+    even = [r for r in pairs if r[0] % 2 == 0]
+    odd = [r for r in pairs if r[0] % 2]
+    print(f"odd base {_macro(odd, base):.4f} fit {_macro(odd, _search(even)):.4f}", flush=True)
+    print(f"even base {_macro(even, base):.4f} fit {_macro(even, _search(odd)):.4f}", flush=True)
+    full = _search(pairs)
+    print(f"all base {_macro(pairs, base):.4f} fit {_macro(pairs, full):.4f}", flush=True)
+    (OUT / "thresh.json").write_text(json.dumps({str(k): list(v) for k, v in full.items()}))
+
+
 def predict() -> None:
     import torch
     from PIL import Image
@@ -357,42 +485,22 @@ def predict() -> None:
                 row["freshness_grade"] = None
             rows.append(row)
         print(path.stem, len(result.boxes), flush=True)
-    # The better public file predicted fewer fresh grades. Pick the logit shift
-    # whose grade counts land closest to that mix.
-    import math
+    thresh = {i: (0.5, 0.5) for i in range(1, 11)}
+    saved = OUT / "thresh.json"
+    if saved.is_file():
+        thresh = {int(k): tuple(v) for k, v in json.loads(saved.read_text()).items()}
+    from collections import Counter
 
-    target = (351, 260, 424)
-
-    def grade_at(p, shift):
-        n = 0
-        out = []
-        for v in p:
-            v = min(max(v, 1e-4), 1 - 1e-4)
-            z = math.log(v / (1 - v)) + shift
-            s = 1 / (1 + math.exp(-z))
-            out.append(s)
-            n += s > 0.5
-        return n, out
-
-    best, best_d = 0.0, 1e9
-    for shift in (0.0, 0.25, 0.5, 0.75, 1.0):
-        counts = [0, 0, 0]
-        for r in rows:
-            if "_p" not in r:
-                continue
-            counts[grade_at(r["_p"], shift)[0]] += 1
-        dist = sum(abs(a - b) for a, b in zip(counts, target))
-        print(f"shift {shift} grades {counts} dist {dist}", flush=True)
-        if dist < best_d:
-            best, best_d = shift, dist
     for r in rows:
         if "_p" not in r:
             continue
-        grade, prob = grade_at(r.pop("_p"), best)
-        masses = (1 - prob[0], prob[0] - prob[1], prob[1])
+        p0, p1 = r.pop("_p")
+        t0, t1 = thresh[r["category_id"]]
+        grade = _grade(p0, p1, t0, t1)
+        masses = (1 - p0, p0 - p1, p1)
         r["freshness_grade"] = grade
-        r["freshness_score"] = round(float(masses[grade]), 4)
-    print(f"using shift {best}", flush=True)
+        r["freshness_score"] = round(float(max(0.0, masses[grade])), 4)
+    print(Counter(r["freshness_grade"] for r in rows), flush=True)
     SUB.parent.mkdir(parents=True, exist_ok=True)
     SUB.write_text(json.dumps(rows))
     print(f"{len(rows)} detections -> {SUB}")
@@ -406,10 +514,12 @@ def main() -> None:
         train_det()
     elif cmd == "fresh":
         train_fresh()
+    elif cmd == "fit":
+        fit()
     elif cmd == "predict":
         predict()
     else:
-        raise SystemExit("usage: fresh.py prep|train|fresh|predict")
+        raise SystemExit("usage: fresh.py prep|train|fresh|fit|predict")
 
 
 if __name__ == "__main__":
