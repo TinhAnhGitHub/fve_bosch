@@ -387,7 +387,7 @@ def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
 
-def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0) -> None:
+def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False) -> None:
     """target unit: shape only, size from scale.py. target mm: shape and size end to end.
 
     On the 10% holdout the end-to-end model beat every unit shape x predicted size
@@ -410,6 +410,12 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
     if seed:  # same holdout, different initialisation and data order: an ensemble member
         rng = np.random.default_rng(1000 + seed)
         torch.manual_seed(seed)
+    if drop_oversized:  # the size head's per-object labels; the holdout check then covers normal objects only
+        with np.load(SCALE, allow_pickle=False) as s:
+            flag = dict(zip(s["ids"].tolist(), s["u"].tolist()))
+        normal = np.array([flag[i] == 0 for i in z["ids"].tolist()])
+        tr, val = tr[normal[tr]], val[normal[val]]
+        print(f"drop oversized: train {len(tr)}, holdout {len(val)} normal objects")
     net = ARCHS[arch](feats.shape[-1], len(vocab)).to(dev)
     print(f"{arch}: {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M parameters")
     lr = 1e-3 if arch == "atlas" else 3e-4
@@ -747,13 +753,14 @@ if __name__ == "__main__":
     ap.add_argument("--encoder", choices=sorted(ENCODERS), default="dinov2b", help="cache, train: image tokens")
     ap.add_argument("--target", choices=["mm", "unit"], default="mm", help="train: millimetre clouds, or unit shape for scale.py")
     ap.add_argument("--seed", type=int, default=0, help="train: init and shuffle seed (holdout split is fixed)")
+    ap.add_argument("--drop-oversized", action="store_true", help="train: leave oversized objects out of training and of the holdout check")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
     if args.cmd == "cache":
         cache(args.encoder)
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized)
     elif args.cmd == "predict":
         if len(args.ckpt) > 1:
             predict_ensemble(args.ckpt)
