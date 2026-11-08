@@ -8,9 +8,10 @@ Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
 arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
 two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
 a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
-One MobileNetV3-Small readout for every food. Exposure and blur are jittered
-on each crop (Krizhevsky, Sutskever, Hinton, 2012), so the lighting of one
-photo is not a grade. Hand-measured color does not survive a new photo.
+One MobileNetV3-Small readout for every food. The pretrained trunk stays
+frozen (Yosinski, Clune, Bengio, Lipson, 2014) and only the two thresholds
+are fit, so a photo cannot be memorised. Hand-measured color does not
+survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -174,12 +175,7 @@ class _Crops:
     def __init__(self, samples, train: bool):
         from torchvision import transforms
 
-        jitter = [
-            transforms.Resize((224, 224)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ColorJitter(0.4, 0.4, 0.2, 0.02),
-            transforms.RandomApply([transforms.GaussianBlur(3, sigma=(0.1, 1.2))], p=0.5),
-        ] if train else [transforms.Resize((224, 224))]
+        jitter = [transforms.Resize((224, 224)), transforms.RandomHorizontalFlip()] if train else [transforms.Resize((224, 224))]
         self.tf = transforms.Compose(
             jitter
             + [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
@@ -244,13 +240,10 @@ def train_fresh() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net, head, bias = _fresh(device)
-    opt = torch.optim.AdamW(
-        [
-            {"params": net.parameters(), "lr": 1e-4},
-            {"params": [head.weight, bias], "lr": 1e-3},
-        ],
-        weight_decay=1e-4,
-    )
+    net.eval()
+    for p in net.parameters():
+        p.requires_grad_(False)
+    opt = torch.optim.AdamW([head.weight, bias], lr=1e-3, weight_decay=1e-4)
     counts = Counter((s[3], s[2]) for s in train_samples)
     weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
@@ -258,7 +251,6 @@ def train_fresh() -> None:
     (OUT / "thresh.json").unlink(missing_ok=True)
     state = None
     for epoch in range(1, 31):
-        net.train()
         total, seen = 0.0, 0
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
