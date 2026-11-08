@@ -166,7 +166,7 @@ class _Crops:
     def __init__(self, samples, train: bool):
         from torchvision import transforms
 
-        jitter = [transforms.Resize((224, 224)), transforms.RandomHorizontalFlip()] if train else [transforms.Resize((224, 224))]
+        jitter = [transforms.Resize((300, 300)), transforms.RandomHorizontalFlip()] if train else [transforms.Resize((300, 300))]
         self.tf = transforms.Compose(
             jitter
             + [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
@@ -217,8 +217,8 @@ def train_fresh() -> None:
     if not train_samples:
         raise SystemExit("no Group A crops")
 
-    net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
-    dim = net.classifier[0].in_features
+    net = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
+    dim = net.classifier[1].in_features
     net.classifier = torch.nn.Identity()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
@@ -332,7 +332,7 @@ def _load_coral(device):
     blob = torch.load(OUT / "coral.pt", map_location=device, weights_only=True)
     if "color" not in blob:
         raise RuntimeError("old head")
-    net = models.mobilenet_v3_large(weights=None)
+    net = models.efficientnet_b3(weights=None)
     net.classifier = torch.nn.Identity()
     net.load_state_dict(blob["net"])
     head = torch.nn.Linear(blob["head"].shape[1], 1, bias=False)
@@ -514,7 +514,7 @@ def _matched(image_ids, by_image):
                 if best_i is None:
                     continue
                 used.add(best_i)
-                boxes.append((crop, gt[best_i][2], cat, image_id))
+                boxes.append((crop, gt[best_i][2], cat))
     return boxes
 
 
@@ -525,17 +525,14 @@ def _score_boxes(net, head, color, bias, boxes, device):
     net.eval()
     x = torch.stack([b[0] for b in boxes]).to(device)
     k = torch.tensor([b[2] - 1 for b in boxes], device=device)
+    grades = []
     with torch.no_grad():
-        logit = _logit(net, head, color, bias, x, k).cpu().numpy()
-    cats = np.asarray([b[2] for b in boxes])
-    images = np.asarray([b[3] for b in boxes])
-    # A pack of meat is one grade. Average the boxes in that photo.
-    for meat in range(6, 11):
-        for image_id in set(images[cats == meat]):
-            sel = (cats == meat) & (images == image_id)
-            logit[sel] = logit[sel].mean(0)
-    grade = (1 / (1 + np.exp(-np.clip(logit, -20, 20))) > 0.5).sum(1)
+        for start in range(0, len(x), 32):
+            part = _logit(net, head, color, bias, x[start : start + 32], k[start : start + 32])
+            grades.append((torch.sigmoid(part) > 0.5).sum(1))
+    grade = torch.cat(grades).cpu().numpy()
     scores, parts = [], []
+    cats = np.asarray([b[2] for b in boxes])
     true = np.asarray([b[1] for b in boxes])
     for cat in range(1, 11):
         m = cats == cat
@@ -591,8 +588,8 @@ def cv() -> None:
         except Exception as exc:
             print("current skipped", type(exc).__name__, flush=True)
     train_samples = [s for s in samples if s[4] not in hold]
-    net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
-    dim = net.classifier[0].in_features
+    net = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
+    dim = net.classifier[1].in_features
     net.classifier = torch.nn.Identity()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
@@ -612,7 +609,7 @@ def cv() -> None:
     loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
     best = -1.0
     (OUT / "thresh.json").unlink(missing_ok=True)
-    for epoch in range(1, 41):
+    for epoch in range(1, 31):
         net.train()
         total, seen = 0.0, 0
         for x, y, k in loader:
@@ -693,17 +690,8 @@ def predict() -> None:
     saved = OUT / "thresh.json"
     if saved.is_file():
         thresh = {int(k): tuple(v) for k, v in json.loads(saved.read_text()).items()}
-    from collections import Counter, defaultdict
+    from collections import Counter
 
-    groups = defaultdict(list)
-    for i, r in enumerate(rows):
-        if "_p" in r and r["category_id"] >= 6:
-            groups[(r["image_id"], r["category_id"])].append(i)
-    for idxs in groups.values():
-        p0 = sum(rows[i]["_p"][0] for i in idxs) / len(idxs)
-        p1 = sum(rows[i]["_p"][1] for i in idxs) / len(idxs)
-        for i in idxs:
-            rows[i]["_p"] = (p0, p1)
     for r in rows:
         if "_p" not in r:
             continue
