@@ -52,6 +52,10 @@ more than any shape error. Each change below is one commit.
    loss takes the minimum over the 4 proper sign flips of the target. It also uses exact
    nearest neighbours over all 8192 points instead of 2048 random ones per side, and,
    since change 1, it is computed on size-normalised targets.
-
-Not in this baseline: retrieving a training mesh by image similarity and scaling it.
-That memorizes the training shapes. It is also someone else's leaderboard entry.
+4. **Retrieval baseline** (`atlas.py predict --shape retrieve`, `evaluate --retrieval`).
+   Copy the unit shape of the most similar training image (DINOv2 class token and mean
+   patch token, cosine, same category) and give it the size head's size. Tatarchenko et
+   al. ("What Do Single-view 3D Reconstruction Networks Learn?", CVPR 2019) show this
+   matches or beats single-view decoders, which mostly recognise and recall. Earlier
+   versions of this file ruled retrieval out as memorising; it is kept here as the bar
+   the decoder has to clear, and the predict flag makes it a submission if it wins.

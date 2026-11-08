@@ -328,6 +328,31 @@ def train(ckpt: Path, epochs: int) -> None:
     print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
+def descriptor(tok: torch.Tensor) -> torch.Tensor:
+    """Retrieval key: class token and mean patch token, unit length. tok (b, 257, dim)."""
+    v = torch.cat([tok[:, 0], tok[:, 1:].mean(1)], -1).float()
+    return torch.nn.functional.normalize(v, dim=-1)
+
+
+def nearest_shape(query: torch.Tensor, q_cat: list[str], bank: torch.Tensor, bank_cat: list[str]) -> np.ndarray:
+    """Index of the most similar bank image, inside the query's category when the bank has it.
+
+    Tatarchenko et al. (CVPR 2019) show that this retrieval baseline matches or beats
+    single-view decoders on ShapeNet, because those decoders mostly recognise and recall.
+    """
+    sim = query @ bank.T
+    cats = np.array(bank_cat)
+    for i, c in enumerate(q_cat):
+        same = torch.from_numpy(cats == c)
+        if same.any():
+            sim[i, ~same] = -float("inf")
+    return sim.argmax(1).numpy()
+
+
+def bank_descriptors(feats: np.ndarray, idx: np.ndarray) -> torch.Tensor:
+    return torch.cat([descriptor(torch.from_numpy(feats[idx[i : i + 64]])) for i in range(0, len(idx), 64)])
+
+
 def load_scale() -> dict[str, float]:
     if not SCALE.exists():
         raise SystemExit(f"missing {SCALE}. Run: uv run baselines/scale.py")
@@ -361,9 +386,17 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
     return net, blob
 
 
-def predict(ckpt: Path) -> None:
+def predict(ckpt: Path, shape: str) -> None:
     dev = device()
-    net, blob = load_net(ckpt, dev)
+    if shape == "retrieve":
+        z, vocab = _load_cache()
+        everyone = np.arange(len(z["ids"]))
+        bank, bank_cat = bank_descriptors(z["feats"], everyone), z["cats"].tolist()
+        pts = z["pts"].astype(np.float32)
+        units = pts / np.sqrt((pts**2).sum(-1).mean(-1))[:, None, None]
+        net, blob = None, {"unit": True, "vocab": vocab}
+    else:
+        net, blob = load_net(ckpt, dev)
     table, rule = load_sizes() if blob.get("unit") else (None, None)
     if rule is not None:
         print(f"hedge q_min {rule['q_min']} frac {rule['frac']}")
@@ -383,11 +416,14 @@ def predict(ckpt: Path) -> None:
                 dtype=torch.long,
                 device=dev,
             )
-            pred = net(tok, cat).cpu().numpy()
+            if net is None:
+                pred = units[nearest_shape(descriptor(tok.cpu()), [p.parent.parent.name for p in chunk], bank, bank_cat)]
+            else:
+                pred = net(tok, cat).cpu().numpy()
             for p, cloud in zip(chunk, pred):
                 clouds[p.parent.name] = to_mm(cloud, p.parent.name, table, rule) if table is not None else cloud
             print(f"predict {min(i + len(chunk), len(paths))}/{len(paths)}", flush=True)
-    out = ROOT / "submissions" / "atlas" / "preds_geometry.zip"
+    out = ROOT / "submissions" / ("atlas" if net is not None else "retrieve") / "preds_geometry.zip"
     pack(out, clouds)
     print(f"{len(clouds)} clouds -> {out}")
 
@@ -420,11 +456,31 @@ def aligned_cd(pred: torch.Tensor, gt: torch.Tensor, iters: int = 10) -> float:
     return best
 
 
-def evaluate(ckpts: list[Path]) -> None:
+def score(tag: str, variants: dict, gt: torch.Tensor, big: torch.Tensor, dev: torch.device) -> None:
+    for name, clouds in variants.items():
+        cd = torch.tensor([aligned_cd(clouds[k].to(dev), gt[k].to(dev)) for k in range(len(gt))])
+        line = f"{tag:18s} {name:24s} CD-L2 {cd.mean():8.1f}  median {cd.median():7.1f}"
+        if big.any():
+            line += f"  normal {cd[~big].mean():8.1f}  oversized {cd[big].mean():9.1f}"
+        print(line, flush=True)
+
+
+def sized(unit: torch.Tensor, ids: list[str], r: torch.Tensor, size: torch.Tensor | None) -> dict:
+    """A unit-shape prediction at the true size, the size head's size, and hedged."""
+    out = {"true size": unit * r[:, None, None]}
+    if size is not None:
+        out["size head"] = unit * size[:, None, None]
+        table, rule = load_sizes()
+        if rule["frac"] > 0:
+            out["size head + hedge"] = [torch.from_numpy(to_mm(unit[k].numpy(), i, table, rule)).float() for k, i in enumerate(ids)]
+    return out
+
+
+def evaluate(ckpts: list[Path], retrieval: bool) -> None:
     """Score holdout predictions the way the grader does, with the predicted and the true size."""
     z, vocab = _load_cache()
     dev = device()
-    val, _, _ = holdout(len(z["ids"]))
+    val, tr, _ = holdout(len(z["ids"]))
     ids = z["ids"][val].tolist()
     feats = torch.tensor(z["feats"][val], dtype=torch.float32)
     gt = torch.tensor(z["pts"][val], dtype=torch.float32)
@@ -438,32 +494,22 @@ def evaluate(ckpts: list[Path]) -> None:
         big = torch.tensor([u[i] == 1 for i in ids])
         err = (size - r).square()
         print(f"size head on holdout: mean (s - s_true)^2 {err.mean():.1f} mm^2, oversized {int(big.sum())}")
+    if retrieval:
+        pick = nearest_shape(descriptor(feats), z["cats"][val].tolist(), bank_descriptors(z["feats"], tr), z["cats"][tr].tolist())
+        bank = torch.tensor(z["pts"][tr[pick]], dtype=torch.float32)
+        score("retrieval", sized(bank / radii(bank)[:, None, None], ids, r, size), gt, big, dev)
     for ckpt in ckpts:
         net, blob = load_net(ckpt, dev)
         with torch.inference_mode():
             pred = torch.cat([net(feats[i : i + 8].to(dev), cat[i : i + 8].to(dev)).cpu() for i in range(0, len(ids), 8)])
-        own = radii(pred - pred.mean(1, keepdim=True))
-        variants = {}
         if blob.get("unit"):
-            variants["true size"] = pred * r[:, None, None]
-            if size is not None:
-                variants["size head"] = pred * size[:, None, None]
-                table, rule = load_sizes()
-                if rule["frac"] > 0:
-                    variants["size head + hedge"] = [
-                        torch.from_numpy(to_mm(pred[k].numpy(), i, table, rule)).float() for k, i in enumerate(ids)
-                    ]
+            variants = sized(pred, ids, r, size)
         else:
-            variants["as trained, mm"] = pred
-            variants["rescaled to true size"] = pred * (r / own)[:, None, None]
+            own = radii(pred - pred.mean(1, keepdim=True))
+            variants = {"as trained, mm": pred, "rescaled to true size": pred * (r / own)[:, None, None]}
             if size is not None:
                 variants["rescaled to size head"] = pred * (size / own)[:, None, None]
-        for name, clouds in variants.items():
-            cd = torch.tensor([aligned_cd(clouds[k].to(dev), gt[k].to(dev)) for k in range(len(ids))])
-            line = f"{ckpt.name:18s} {name:24s} CD-L2 {cd.mean():8.1f}  median {cd.median():7.1f}"
-            if big.any():
-                line += f"  normal {cd[~big].mean():8.1f}  oversized {cd[big].mean():9.1f}"
-            print(line, flush=True)
+        score(ckpt.name, variants, gt, big, dev)
 
 
 def fit_check() -> None:
@@ -492,14 +538,16 @@ if __name__ == "__main__":
     ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "train", "predict", "evaluate", "check"])
     ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
     ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
+    ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
     if args.cmd == "cache":
         cache()
     elif args.cmd == "train":
         train(args.ckpt[0], args.epochs)
     elif args.cmd == "predict":
-        predict(args.ckpt[0])
+        predict(args.ckpt[0], args.shape)
     elif args.cmd == "evaluate":
-        evaluate(args.ckpt)
+        evaluate(args.ckpt if args.ckpt != [CKPT] or CKPT.exists() else [], args.retrieval)
     else:
         fit_check()
