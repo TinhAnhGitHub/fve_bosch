@@ -41,6 +41,12 @@ more than any shape error. Each change below is one commit.
    MoGe-2 (Wang et al., 2025) makes the same split between an affine-invariant shape
    and a separate metric scale. `atlas.py evaluate` scores the 10% holdout with the
    predicted and with the true size, which splits the error into size and shape parts.
+2. **Hedged output** (`geom.hedge`, `scale.py hedge`). When P(oversized) is unsure, the
+   cloud keeps all points at the likely size and adds a share at the other cluster size.
+   Wrong extra points only cost their share of one Chamfer half; if that size was right
+   they save the other half, which would be the full size error. The threshold and the
+   share are tuned on every training object with its out-of-fold size and its true
+   shape. This comes from our own reasoning and a toy simulation, not from a paper.
 
 Not in this baseline: retrieving a training mesh by image similarity and scaling it.
 That memorizes the training shapes. It is also someone else's leaderboard entry.

@@ -30,10 +30,16 @@ the DINOv2-B class token and mean patch token from atlas.py.
 
   uv run baselines/atlas.py cache        # first: clouds give the size labels
   uv run baselines/scale.py              # writes baselines/out/scale/scale.npz
+  uv run baselines/scale.py hedge        # tunes geom.hedge -> baselines/out/scale/hedge.json
+
+Hedge: when P(oversized) is unsure, put points at both cluster sizes (geom.hedge).
+Its threshold and share are tuned on every training object with its out-of-fold size
+and its TRUE unit shape, so only the size decision is being scored.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -51,6 +57,8 @@ FOLDS = 5
 ALPHAS = (100.0, 1000.0, 3000.0, 10000.0)
 CS = (0.01, 0.1)
 W_P = (0.0, 0.25, 0.5, 0.75, 1.0)
+Q_MIN = (0.02, 0.05, 0.1, 0.15, 0.2)
+FRAC = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1)
 
 
 def cluster_labels(y: np.ndarray, cats: np.ndarray, groups: np.ndarray) -> np.ndarray:
@@ -296,5 +304,50 @@ def main() -> None:
     print(f"train rows are out-of-fold, val rows from the full fit -> {OUT / 'scale.npz'}")
 
 
+def cluster_sizes(z) -> np.ndarray:
+    """Expected linear radius of each cluster: exp(mu + sig^2 / 2)."""
+    return np.exp(z["mu"] + z["sig"][None, :] ** 2 / 2)
+
+
+def tune_hedge() -> None:
+    import torch
+    from geom import hedge
+
+    zs = np.load(OUT / "scale.npz", allow_pickle=False)
+    pts = np.load(ATLAS / "train.npz", allow_pickle=False)["pts"]
+    n = len(pts)
+    p, sizes, u = zs["p"][:n], cluster_sizes(zs)[:n], zs["u"][:n]
+    r = np.sqrt((pts.astype(np.float64) ** 2).sum(-1).mean(-1))
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sub = np.random.default_rng(0).choice(pts.shape[1], 2048, replace=False)
+
+    def cd(pred: np.ndarray, gt: np.ndarray) -> float:
+        a = torch.tensor(pred, dtype=torch.float32, device=dev)
+        b = torch.tensor(gt, dtype=torch.float32, device=dev)
+        d = torch.cdist(a, b).square()
+        return float(d.min(1).values.mean() + d.min(0).values.mean())
+
+    unit = [pts[i][sub] / r[i] for i in range(n)]
+    gt = [pts[i][sub] for i in range(n)]
+    plain = np.array([cd(hedge(unit[i], p[i], sizes[i], 1.0, 0.0), gt[i]) for i in range(n)])
+    print(f"no hedge: CD-L2 {plain.mean():.1f}  normal {plain[u == 0].mean():.1f}  oversized {plain[u == 1].mean():.1f}")
+    best = (1.0, 0.0, plain.mean())
+    for q_min in Q_MIN:
+        hit = np.flatnonzero(np.minimum(p, 1 - p) >= q_min)
+        for frac in FRAC:
+            cds = plain.copy()
+            cds[hit] = [cd(hedge(unit[i], p[i], sizes[i], q_min, frac), gt[i]) for i in hit]
+            print(f"q_min {q_min:.2f} frac {frac:.3f}  hedged {len(hit):4d}  CD-L2 {cds.mean():8.1f}  "
+                  f"normal {cds[u == 0].mean():7.1f}  oversized {cds[u == 1].mean():9.1f}", flush=True)
+            if cds.mean() < best[2]:
+                best = (q_min, frac, float(cds.mean()))
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / "hedge.json").write_text(json.dumps({"q_min": best[0], "frac": best[1], "cd_true_shape": best[2]}))
+    print(f"best q_min {best[0]} frac {best[1]}  CD-L2 {best[2]:.1f} vs {plain.mean():.1f} -> {OUT / 'hedge.json'}")
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "hedge":
+        tune_hedge()
+    else:
+        main()

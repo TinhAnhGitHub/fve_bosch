@@ -33,12 +33,13 @@ from PIL import Image
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from geom import MIN_POINTS, canonicalize, pack
+from geom import MIN_POINTS, canonicalize, hedge, pack
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "baselines" / "out" / "atlas"
 CKPT = OUT / "atlas.pt"
 SCALE = ROOT / "baselines" / "out" / "scale" / "scale.npz"
+HEDGE = ROOT / "baselines" / "out" / "scale" / "hedge.json"
 IMAGE = 224
 N = MIN_POINTS
 PATCHES = 8
@@ -283,6 +284,23 @@ def load_scale() -> dict[str, float]:
     return dict(zip(z["ids"].tolist(), z["s"].tolist()))
 
 
+def load_sizes() -> tuple[dict[str, tuple[float, tuple[float, float]]], dict]:
+    """Per id: P(oversized) and the expected radius of each cluster, plus the tuned hedge."""
+    import json
+
+    load_scale()
+    z = np.load(SCALE, allow_pickle=False)
+    sizes = np.exp(z["mu"] + z["sig"][None, :] ** 2 / 2)
+    table = {i: (float(p), (float(a), float(b))) for i, p, (a, b) in zip(z["ids"].tolist(), z["p"], sizes)}
+    rule = json.loads(HEDGE.read_text()) if HEDGE.exists() else {"q_min": 1.0, "frac": 0.0}
+    return table, rule
+
+
+def to_mm(unit: np.ndarray, sample_id: str, table: dict, rule: dict) -> np.ndarray:
+    p, sizes = table[sample_id]
+    return hedge(unit, p, sizes, rule["q_min"], rule["frac"])
+
+
 def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
     if not ckpt.exists():
         raise SystemExit(f"missing {ckpt}. Run: uv run baselines/atlas.py train")
@@ -295,7 +313,9 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
 def predict(ckpt: Path) -> None:
     dev = device()
     net, blob = load_net(ckpt, dev)
-    size = load_scale() if blob.get("unit") else None
+    table, rule = load_sizes() if blob.get("unit") else (None, None)
+    if rule is not None:
+        print(f"hedge q_min {rule['q_min']} frac {rule['frac']}")
     enc = encoder(dev)
     paths = rows("val")
     if not paths:
@@ -314,7 +334,7 @@ def predict(ckpt: Path) -> None:
             )
             pred = net(tok, cat).cpu().numpy()
             for p, cloud in zip(chunk, pred):
-                clouds[p.parent.name] = cloud * size[p.parent.name] if size is not None else cloud
+                clouds[p.parent.name] = to_mm(cloud, p.parent.name, table, rule) if table is not None else cloud
             print(f"predict {min(i + len(chunk), len(paths))}/{len(paths)}", flush=True)
     out = ROOT / "submissions" / "atlas" / "preds_geometry.zip"
     pack(out, clouds)
@@ -390,6 +410,11 @@ def evaluate(ckpts: list[Path]) -> None:
             variants["true size"] = pred * r[:, None, None]
             if size is not None:
                 variants["size head"] = pred * size[:, None, None]
+                table, rule = load_sizes()
+                if rule["frac"] > 0:
+                    variants["size head + hedge"] = [
+                        torch.from_numpy(to_mm(pred[k].numpy(), i, table, rule)).float() for k, i in enumerate(ids)
+                    ]
         else:
             variants["as trained, mm"] = pred
             variants["rescaled to true size"] = pred * (r / own)[:, None, None]

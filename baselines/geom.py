@@ -25,6 +25,23 @@ def rms_radius(points: np.ndarray) -> float:
     return float(np.sqrt(((x - x.mean(0)) ** 2).sum(-1).mean()))
 
 
+def hedge(unit: np.ndarray, p: float, sizes: tuple[float, float], q_min: float, frac: float) -> np.ndarray:
+    """Millimetre cloud from a unit shape and a two-cluster size: normal (0) or oversized (1).
+
+    When the less likely cluster has probability >= q_min, all points go at the likely
+    size and a further `frac` share at the other one. Chamfer is two averages: wrong
+    extra points cost only their share of the prediction-to-truth half, but if the
+    other size was right they cover the truth, and the truth-to-prediction half would
+    otherwise be the full size error. Otherwise one cloud at the expected size.
+    """
+    q = min(p, 1.0 - p)
+    if frac <= 0.0 or q < q_min:
+        return unit * ((1.0 - p) * sizes[0] + p * sizes[1])
+    k = int(p >= 0.5)
+    take = np.linspace(0, len(unit) - 1, max(1, round(frac * len(unit)))).astype(int)
+    return np.concatenate([unit * sizes[k], unit[take] * sizes[1 - k]])
+
+
 def canonicalize(points: np.ndarray) -> np.ndarray:
     """Center, then rotate onto principal axes. Do not rescale."""
     x = np.asarray(points, np.float64)
@@ -88,6 +105,9 @@ def _check() -> None:
     assert same < 1e-6, same
     assert bigger > 10.0, bigger
     assert abs(rms_radius(pts * 3.0) - 3.0 * rms_radius(moved)) < 1e-9
+    h = hedge(pts, 0.4, (1.0, 8.0), 0.2, 0.5)
+    assert len(h) == 60 and abs(h[:40] - pts).max() < 1e-12
+    assert np.allclose(hedge(pts, 0.1, (1.0, 8.0), 0.2, 0.5), pts * 1.7)
     pack(Path("/tmp/f3dr_check.zip"), {"a": pts}, min_points=len(pts))
     with zipfile.ZipFile("/tmp/f3dr_check.zip") as zf:
         body = zf.read("geometry/a.ply").decode()
