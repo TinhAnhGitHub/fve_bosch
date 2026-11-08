@@ -72,3 +72,19 @@ more than any shape error. Each change below is one commit.
    DINOv3 ViT-L/16 (Simeoni et al., 2025) at 256 px gives the same 257-token layout
    (class + 16 x 16 patches, registers dropped) at width 1024. The size head already
    uses DINOv3-H+ class tokens from the FVE cache.
+
+## What the holdout said (10% split, local grader: PCA flips + ICP, scale kept)
+
+| Prediction                                   | CD-L2 mm^2 | normal | oversized |
+|----------------------------------------------|-----------:|-------:|----------:|
+| original atlas, trained in mm                |    **457** |    158 |      3059 |
+| retrieval shape x true size                  |         67 |     38 |       320 |
+| retrieval shape x size head                  |        819 |    281 |      5507 |
+| retrieval shape x size head + hedge          |        566 |    284 |      3024 |
+| original atlas rescaled to the true size     |        631 |    254 |      3921 |
+
+Unit shape x one predicted size loses to the end-to-end model even with a near-perfect
+shape: trained in mm, the decoder spreads its points over the sizes it is unsure of,
+which squared Chamfer rewards. So `train --target mm` (end to end) is the default and
+`--target unit` + scale.py is kept for the size experiments. The hedge still helps any
+unit-shape prediction (819 -> 566).

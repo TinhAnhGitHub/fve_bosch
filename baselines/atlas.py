@@ -233,7 +233,7 @@ class DeepAtlas(Atlas):
             t = self.tok(self.norm_tok(tok))
             for block in self.blocks:
                 x = block(x, t)
-            return self.out(x).float()
+        return self.out(x.float())  # fp32 head: millimetre targets need the precision
 
 
 ARCHS = {"atlas": Atlas, "deep": DeepAtlas}
@@ -387,7 +387,13 @@ def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
 
-def train(ckpt: Path, epochs: int, arch: str, enc: str) -> None:
+def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str) -> None:
+    """target unit: shape only, size from scale.py. target mm: shape and size end to end.
+
+    On the 10% holdout the end-to-end model beat every unit shape x predicted size
+    (457 vs >= 566 mm^2): trained in mm, the decoder learns to spread its points over
+    the sizes it is unsure of, which squared Chamfer rewards.
+    """
     z, vocab = _load_cache(enc)
     dev = device()
     feats = torch.tensor(z["feats"], dtype=torch.float32)
@@ -395,7 +401,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str) -> None:
         raise SystemExit("cache has no patch tokens. Run: python baselines/atlas.py cache")
     pts = torch.tensor(z["pts"], dtype=torch.float32)
     r = radii(pts)
-    unit = pts / r[:, None, None]
+    unit = pts / r[:, None, None] if target == "unit" else pts
     cat = torch.tensor([vocab[c] for c in z["cats"].tolist()], dtype=torch.long)
     val, tr, rng = holdout(len(feats))
     net = ARCHS[arch](feats.shape[-1], len(vocab)).to(dev)
@@ -434,15 +440,16 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str) -> None:
                 pred = net(feats[b].to(dev), cat[b].to(dev))
                 # shape error in mm^2 at the true size: CD scales with r^2
                 for j, k in enumerate(b):
-                    vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev))) * float(r[k]) ** 2
+                    gain = float(r[k]) ** 2 if target == "unit" else 1.0
+                    vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev))) * gain
                 vseen += len(b)
         score = vtotal / vseen
         if score < best_score:
             best_score = score
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
-        print(f"epoch {epoch}  train {total / seen:.4f} unit^2  holdout {score:.1f} mm^2 at true size", flush=True)
+        print(f"epoch {epoch}  train {total / seen:.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else ""), flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": True, "arch": arch, "encoder": enc}, ckpt)
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
@@ -673,13 +680,14 @@ if __name__ == "__main__":
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--arch", choices=sorted(ARCHS), default="deep", help="train: decoder (atlas = the original)")
     ap.add_argument("--encoder", choices=sorted(ENCODERS), default="dinov2b", help="cache, train: image tokens")
+    ap.add_argument("--target", choices=["mm", "unit"], default="mm", help="train: millimetre clouds, or unit shape for scale.py")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
     if args.cmd == "cache":
         cache(args.encoder)
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch, args.encoder)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target)
     elif args.cmd == "predict":
         predict(args.ckpt[0], args.shape)
     elif args.cmd == "evaluate":
