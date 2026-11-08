@@ -8,10 +8,9 @@ Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
 arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
 two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
 a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
-One MobileNetV3-Small readout for every food. The crop is the box itself.
-A wider crop takes in the next berry, and half the grape photos mix grades
-(Girshick, 2015, Fast R-CNN: the region is the instance). Hand-measured
-color does not survive a new photo.
+One MobileNetV3-Small readout for every food. A fifth of each food's photos
+is held out, meats included, and the epoch that grades those photos best is
+the one kept. Hand-measured color does not survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -194,14 +193,14 @@ class _Crops:
         return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.0, jitter: bool = False):
+def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
     import random
 
     x, y, w, h = [float(v) for v in bbox]
     if jitter:
-        pad = random.uniform(0.0, 0.05)
-        x += random.uniform(-0.04, 0.04) * w
-        y += random.uniform(-0.04, 0.04) * h
+        pad = random.uniform(0.0, 0.2)
+        x += random.uniform(-0.08, 0.08) * w
+        y += random.uniform(-0.08, 0.08) * h
     box = (
         max(0, int(x - pad * w)),
         max(0, int(y - pad * h)),
@@ -230,11 +229,15 @@ def train_fresh() -> None:
     from collections import Counter
     from torch.utils.data import DataLoader, WeightedRandomSampler
 
-    meta = json.loads((OUT / "meta.json").read_text())
-    hold = set(meta["holdout"])
     samples = group_a_crops() + matched_crops()
+    hold = _hold_ids(samples)
     train_samples = [s for s in samples if s[4] not in hold]
     val_samples = [s for s in samples if s[4] in hold]
+    held = {}
+    for s in val_samples:
+        held.setdefault(s[3], 0)
+        held[s[3]] += 1
+    print("hold", " ".join(f"{c}:{held[c]}" for c in sorted(held)), flush=True)
     if not train_samples:
         raise SystemExit("no Group A crops")
 
@@ -252,7 +255,7 @@ def train_fresh() -> None:
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
     (OUT / "thresh.json").unlink(missing_ok=True)
-    state = None
+    best, state = -1.0, None
     for epoch in range(1, 31):
         net.train()
         total, seen = 0.0, 0
@@ -267,10 +270,29 @@ def train_fresh() -> None:
             total += float(loss.detach()) * len(y)
             seen += len(y)
         score = _holdout_qwk(net, head, bias, val_samples, device)
-        print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {score:.4f}", flush=True)
-        state = _state(net, head, bias)
+        mark = ""
+        if score > best:
+            best, state = score, _state(net, head, bias)
+            mark = " saved"
+        print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {score:.4f}{mark}", flush=True)
     torch.save(state, OUT / "coral.pt")
-    print(f"saved {OUT / 'coral.pt'} qwk {score:.4f}")
+    print(f"saved {OUT / 'coral.pt'} qwk {best:.4f}")
+
+
+def _hold_ids(samples) -> set:
+    by_cat = {}
+    for s in samples:
+        by_cat.setdefault(s[3], set()).add(s[4])
+    rng = random.Random(0)
+    hold = set()
+    for cat in sorted(by_cat):
+        ids = sorted(by_cat[cat])
+        rng.shuffle(ids)
+        n = max(1, len(ids) // 5)
+        if len(ids) - n < 2:
+            n = max(0, len(ids) - 2)
+        hold.update(ids[:n])
+    return hold
 
 
 def _holdout_qwk(net, head, bias, samples, device) -> float:
@@ -293,11 +315,11 @@ def _holdout_qwk(net, head, bias, samples, device) -> float:
     for cat in sorted(set(cats)):
         yt = [t for t, c in zip(trues, cats) if c == cat]
         yp = [p for p, c in zip(preds, cats) if c == cat]
-        if len(yt) < 2:
+        if len(yt) < 2 or len(set(yt)) < 2:
             continue
         q = _qwk(np.asarray(yt), np.asarray(yp))
         scores.append(q)
-        parts.append(f"{cat}:{q:.2f}")
+        parts.append(f"{cat}:{q:.2f}/{len(yt)}")
     print(" ".join(parts), flush=True)
     return float(sum(scores) / len(scores)) if scores else 0.0
 
