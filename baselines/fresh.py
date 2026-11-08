@@ -8,9 +8,11 @@ Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
 arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
 two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
 a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
-One MobileNetV3-Small readout for every food. A fifth of each food's photos
-is held out, meats included, and the epoch that grades those photos best is
-the one kept. Hand-measured color does not survive a new photo.
+One MobileNetV3-Small trunk for every food, and a separate CORAL direction
+per food. A grape spoils by losing green; a chop spoils by losing red, so one
+shared direction grades grapes backwards. A fifth of each food's photos is
+held out, meats included, and the epoch that grades those photos best is the
+one kept. Hand-measured color does not survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -218,7 +220,7 @@ def _fresh(device):
     dim = net.classifier[0].in_features
     net.classifier = torch.nn.Identity()
     net = net.to(device)
-    head = torch.nn.Linear(dim, 1, bias=False).to(device)
+    head = torch.nn.Linear(dim, 10, bias=False).to(device)
     bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
     return net, head, bias
 
@@ -345,7 +347,9 @@ def _logit(net, head, bias, x, k):
     bb = bias[index]
     if bb.dim() == 1:
         bb = bb.view(1, -1)
-    return head(net(x)) + bb
+    feat = net(x)
+    score = (feat * head.weight[index]).sum(-1, keepdim=True)
+    return score + bb
 
 
 def _state(net, head, bias):
@@ -366,7 +370,7 @@ def _load_coral(device):
     net = models.mobilenet_v3_small(weights=None)
     net.classifier = torch.nn.Identity()
     net.load_state_dict(blob["net"])
-    head = torch.nn.Linear(blob["head"].shape[1], 1, bias=False)
+    head = torch.nn.Linear(blob["head"].shape[1], blob["head"].shape[0], bias=False)
     head.weight.data.copy_(blob["head"])
     return net.to(device).eval(), head.to(device).eval(), blob["bias"].to(device)
 
