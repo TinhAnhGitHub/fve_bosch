@@ -24,3 +24,6 @@ baselines/out/
 
 # Predictions
 submissions/
+
+# Cached image features copied or linked from the FVE branch
+features/*.npz

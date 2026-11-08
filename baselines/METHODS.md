@@ -27,5 +27,20 @@ Three published methods fit this setting.
    needs the external reconstructor and its weights. It is the upgrade when (1) cannot
    represent a thin surface such as a shrimp.
 
+## Improvements on this branch
+
+The score keeps scale and squares millimetres, so a size error on a large object costs
+more than any shape error. Each change below is one commit.
+
+1. **Separate size head** (`baselines/scale.py`). The decoder now draws a unit-size
+   shape: targets are divided by their RMS radius. A second model predicts that radius
+   in mm from frozen image features: the FVE volume pipeline retargeted from log volume
+   to log radius (category/cluster table, ridge offset, P(oversized)), without kNN.
+   The output size is the posterior mean of the radius, because squared Chamfer error
+   grows with (s - s_true)^2, and settings are picked on out-of-fold mm^2 error.
+   MoGe-2 (Wang et al., 2025) makes the same split between an affine-invariant shape
+   and a separate metric scale. `atlas.py evaluate` scores the 10% holdout with the
+   predicted and with the true size, which splits the error into size and shape parts.
+
 Not in this baseline: retrieving a training mesh by image similarity and scaling it.
 That memorizes the training shapes. It is also someone else's leaderboard entry.

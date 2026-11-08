@@ -7,11 +7,14 @@
 Groueix et al., CVPR 2018: a decoder folds a 2D grid onto the surface.
 A frozen DINOv2 ViT-B/14 (Oquab et al., 2023) reads the image. Each output
 point attends to the patch tokens, not only the class token. Targets are the
-canonical millimetre clouds from geom.py. The category vector is learned.
-It is not a retrieved training mesh.
+canonical clouds from geom.py, divided by their RMS radius: the decoder
+draws a unit-size shape and scale.py says how many millimetres that is.
+The category vector is learned. It is not a retrieved training mesh.
 
   uv run baselines/atlas.py cache
   uv run baselines/atlas.py train
+  uv run baselines/scale.py
+  uv run baselines/atlas.py evaluate     # local grader on the 10% holdout
   uv run baselines/atlas.py predict
 
 cache and train use whatever GPU is present. ViT-B/14 at 224 plus this
@@ -20,6 +23,7 @@ decoder fits an L4. CPU still runs, only slower. An A100 is not required.
 
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -29,11 +33,12 @@ from PIL import Image
 from torch import nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from geom import MIN_POINTS, canonicalize, pack  # noqa: E402
+from geom import MIN_POINTS, canonicalize, pack
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "baselines" / "out" / "atlas"
 CKPT = OUT / "atlas.pt"
+SCALE = ROOT / "baselines" / "out" / "scale" / "scale.npz"
 IMAGE = 224
 N = MIN_POINTS
 PATCHES = 8
@@ -209,23 +214,34 @@ def _load_cache():
     return z, vocab
 
 
-def train() -> None:
+def holdout(n: int) -> tuple[np.ndarray, np.ndarray, np.random.Generator]:
+    """The fixed 10% holdout (seed 0) shared by train and evaluate."""
+    rng = np.random.default_rng(0)
+    order = rng.permutation(n)
+    cut = max(1, int(n * 0.1))
+    return order[:cut], order[cut:], rng
+
+
+def radii(pts: torch.Tensor) -> torch.Tensor:
+    return pts.square().sum(-1).mean(-1).sqrt()
+
+
+def train(ckpt: Path, epochs: int) -> None:
     z, vocab = _load_cache()
     dev = device()
     feats = torch.tensor(z["feats"], dtype=torch.float32)
     if feats.ndim != 3:
         raise SystemExit("cache has no patch tokens. Run: python baselines/atlas.py cache")
     pts = torch.tensor(z["pts"], dtype=torch.float32)
+    r = radii(pts)
+    unit = pts / r[:, None, None]
     cat = torch.tensor([vocab[c] for c in z["cats"].tolist()], dtype=torch.long)
-    rng = np.random.default_rng(0)
-    order = rng.permutation(len(feats))
-    cut = max(1, int(len(order) * 0.1))
-    val, tr = order[:cut], order[cut:]
+    val, tr, rng = holdout(len(feats))
     net = Atlas(feats.shape[-1], len(vocab)).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
     batch = 4 if dev.type == "cuda" else 2
     best, best_score = None, float("inf")
-    for epoch in range(1, 41):
+    for epoch in range(1, epochs + 1):
         net.train()
         rng.shuffle(tr)
         total = 0.0
@@ -233,7 +249,7 @@ def train() -> None:
         for i in range(0, len(tr), batch):
             b = tr[i : i + batch]
             pred = net(feats[b].to(dev), cat[b].to(dev))
-            gt = pts[b].to(dev)
+            gt = unit[b].to(dev)
             loss = cd_l2(pred, gt)
             opt.zero_grad()
             loss.backward()
@@ -245,25 +261,41 @@ def train() -> None:
         with torch.inference_mode():
             for i in range(0, len(val), batch):
                 b = val[i : i + batch]
-                vtotal += float(cd_l2(net(feats[b].to(dev), cat[b].to(dev)), pts[b].to(dev), k=8192)) * len(b)
+                pred = net(feats[b].to(dev), cat[b].to(dev))
+                # shape error in mm^2 at the true size: CD scales with r^2
+                for j, k in enumerate(b):
+                    vtotal += float(cd_l2(pred[j : j + 1], unit[k : k + 1].to(dev), k=8192)) * float(r[k]) ** 2
                 vseen += len(b)
         score = vtotal / vseen
         if score < best_score:
             best_score = score
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
-        print(f"epoch {epoch}  train {total / seen:.1f}  holdout {score:.1f}", flush=True)
-    OUT.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1]}, CKPT)
-    print(f"saved {CKPT}  holdout {best_score:.1f}")
+        print(f"epoch {epoch}  train {total / seen:.4f} unit^2  holdout {score:.1f} mm^2 at true size", flush=True)
+    ckpt.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": True}, ckpt)
+    print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
-def predict() -> None:
-    if not CKPT.exists():
-        raise SystemExit(f"missing {CKPT}. Run: uv run baselines/atlas.py train")
-    blob = torch.load(CKPT, map_location="cpu", weights_only=False)
-    dev = device()
+def load_scale() -> dict[str, float]:
+    if not SCALE.exists():
+        raise SystemExit(f"missing {SCALE}. Run: uv run baselines/scale.py")
+    z = np.load(SCALE, allow_pickle=False)
+    return dict(zip(z["ids"].tolist(), z["s"].tolist()))
+
+
+def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
+    if not ckpt.exists():
+        raise SystemExit(f"missing {ckpt}. Run: uv run baselines/atlas.py train")
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     net = Atlas(blob["dim"], len(blob["vocab"])).to(dev).eval()
     net.load_state_dict(blob["state"])
+    return net, blob
+
+
+def predict(ckpt: Path) -> None:
+    dev = device()
+    net, blob = load_net(ckpt, dev)
+    size = load_scale() if blob.get("unit") else None
     enc = encoder(dev)
     paths = rows("val")
     if not paths:
@@ -282,11 +314,93 @@ def predict() -> None:
             )
             pred = net(tok, cat).cpu().numpy()
             for p, cloud in zip(chunk, pred):
-                clouds[p.parent.name] = cloud
+                clouds[p.parent.name] = cloud * size[p.parent.name] if size is not None else cloud
             print(f"predict {min(i + len(chunk), len(paths))}/{len(paths)}", flush=True)
     out = ROOT / "submissions" / "atlas" / "preds_geometry.zip"
     pack(out, clouds)
     print(f"{len(clouds)} clouds -> {out}")
+
+
+FLIPS = torch.tensor([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], dtype=torch.float32)
+
+
+def nearest(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> tuple[torch.Tensor, torch.Tensor]:
+    """Squared distance and index of the nearest b for every a. a (n, 3), b (m, 3)."""
+    d, j = [], []
+    for s in range(0, len(a), chunk):
+        v, k = torch.cdist(a[s : s + chunk], b).square().min(1)
+        d.append(v)
+        j.append(k)
+    return torch.cat(d), torch.cat(j)
+
+
+def kabsch(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Rotation and translation that move a onto b, no scale."""
+    ca, cb = a.mean(0), b.mean(0)
+    u, _, vt = torch.linalg.svd((a - ca).T @ (b - cb))
+    fix = torch.ones(3, device=a.device)
+    fix[2] = torch.sign(torch.det(vt.T @ u.T))
+    rot = vt.T @ torch.diag(fix) @ u.T
+    return rot, cb - rot @ ca
+
+
+@torch.no_grad()
+def aligned_cd(pred: torch.Tensor, gt: torch.Tensor, iters: int = 10) -> float:
+    """Local copy of the grader: best rotation and translation, scale kept. Unit mm^2.
+
+    Starts from the 4 proper sign flips of the PCA frame, then point-to-point ICP.
+    """
+    best = float("inf")
+    for flip in FLIPS.to(pred.device):
+        q = pred * flip
+        q = q - q.mean(0) + gt.mean(0)
+        for _ in range(iters):
+            _, j = nearest(q, gt)
+            rot, t = kabsch(q, gt[j])
+            q = q @ rot.T + t
+        best = min(best, float(nearest(q, gt)[0].mean() + nearest(gt, q)[0].mean()))
+    return best
+
+
+def evaluate(ckpts: list[Path]) -> None:
+    """Score holdout predictions the way the grader does, with the predicted and the true size."""
+    z, vocab = _load_cache()
+    dev = device()
+    val, _, _ = holdout(len(z["ids"]))
+    ids = z["ids"][val].tolist()
+    feats = torch.tensor(z["feats"][val], dtype=torch.float32)
+    gt = torch.tensor(z["pts"][val], dtype=torch.float32)
+    r = radii(gt)
+    cat = torch.tensor([vocab[c] for c in z["cats"][val].tolist()], dtype=torch.long)
+    size = torch.tensor([load_scale()[i] for i in ids]) if SCALE.exists() else None
+    big = torch.zeros(len(ids), dtype=torch.bool)
+    if SCALE.exists():
+        zs = np.load(SCALE, allow_pickle=False)
+        u = dict(zip(zs["ids"].tolist(), zs["u"].tolist()))
+        big = torch.tensor([u[i] == 1 for i in ids])
+        err = (size - r).square()
+        print(f"size head on holdout: mean (s - s_true)^2 {err.mean():.1f} mm^2, oversized {int(big.sum())}")
+    for ckpt in ckpts:
+        net, blob = load_net(ckpt, dev)
+        with torch.inference_mode():
+            pred = torch.cat([net(feats[i : i + 8].to(dev), cat[i : i + 8].to(dev)).cpu() for i in range(0, len(ids), 8)])
+        own = radii(pred - pred.mean(1, keepdim=True))
+        variants = {}
+        if blob.get("unit"):
+            variants["true size"] = pred * r[:, None, None]
+            if size is not None:
+                variants["size head"] = pred * size[:, None, None]
+        else:
+            variants["as trained, mm"] = pred
+            variants["rescaled to true size"] = pred * (r / own)[:, None, None]
+            if size is not None:
+                variants["rescaled to size head"] = pred * (size / own)[:, None, None]
+        for name, clouds in variants.items():
+            cd = torch.tensor([aligned_cd(clouds[k].to(dev), gt[k].to(dev)) for k in range(len(ids))])
+            line = f"{ckpt.name:18s} {name:24s} CD-L2 {cd.mean():8.1f}  median {cd.median():7.1f}"
+            if big.any():
+                line += f"  normal {cd[~big].mean():8.1f}  oversized {cd[big].mean():9.1f}"
+            print(line, flush=True)
 
 
 def fit_check() -> None:
@@ -309,14 +423,18 @@ def fit_check() -> None:
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "train"
-    if cmd == "cache":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "train", "predict", "evaluate", "check"])
+    ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
+    ap.add_argument("--epochs", type=int, default=40)
+    args = ap.parse_args()
+    if args.cmd == "cache":
         cache()
-    elif cmd == "train":
-        train()
-    elif cmd == "predict":
-        predict()
-    elif cmd == "check":
-        fit_check()
+    elif args.cmd == "train":
+        train(args.ckpt[0], args.epochs)
+    elif args.cmd == "predict":
+        predict(args.ckpt[0])
+    elif args.cmd == "evaluate":
+        evaluate(args.ckpt)
     else:
-        raise SystemExit("use cache, train, predict, or check")
+        fit_check()

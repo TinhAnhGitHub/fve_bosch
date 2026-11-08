@@ -19,6 +19,12 @@ import numpy as np
 MIN_POINTS = 8192  # challenge rule for a submitted point cloud
 
 
+def rms_radius(points: np.ndarray) -> float:
+    """Size of a cloud in its own units: root mean square distance to the centroid."""
+    x = np.asarray(points, np.float64)
+    return float(np.sqrt(((x - x.mean(0)) ** 2).sum(-1).mean()))
+
+
 def canonicalize(points: np.ndarray) -> np.ndarray:
     """Center, then rotate onto principal axes. Do not rescale."""
     x = np.asarray(points, np.float64)
@@ -81,6 +87,7 @@ def _check() -> None:
     bigger = cd_l2(canonicalize(pts), canonicalize(pts * 2.0))
     assert same < 1e-6, same
     assert bigger > 10.0, bigger
+    assert abs(rms_radius(pts * 3.0) - 3.0 * rms_radius(moved)) < 1e-9
     pack(Path("/tmp/f3dr_check.zip"), {"a": pts}, min_points=len(pts))
     with zipfile.ZipFile("/tmp/f3dr_check.zip") as zf:
         body = zf.read("geometry/a.ply").decode()
