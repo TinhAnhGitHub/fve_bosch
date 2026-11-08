@@ -8,10 +8,10 @@ Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
 arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
 two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
 a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
-One MobileNetV3-Small readout for every food. The pretrained trunk stays
-frozen (Yosinski, Clune, Bengio, Lipson, 2014) and only the two thresholds
-are fit, so a photo cannot be memorised. Hand-measured color does not
-survive a new photo.
+One MobileNetV3-Small readout for every food. The crop is the box itself.
+A wider crop takes in the next berry, and half the grape photos mix grades
+(Girshick, 2015, Fast R-CNN: the region is the instance). Hand-measured
+color does not survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -194,14 +194,14 @@ class _Crops:
         return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
+def _crop(im, bbox, pad: float = 0.0, jitter: bool = False):
     import random
 
     x, y, w, h = [float(v) for v in bbox]
     if jitter:
-        pad = random.uniform(0.0, 0.2)
-        x += random.uniform(-0.08, 0.08) * w
-        y += random.uniform(-0.08, 0.08) * h
+        pad = random.uniform(0.0, 0.05)
+        x += random.uniform(-0.04, 0.04) * w
+        y += random.uniform(-0.04, 0.04) * h
     box = (
         max(0, int(x - pad * w)),
         max(0, int(y - pad * h)),
@@ -240,10 +240,13 @@ def train_fresh() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net, head, bias = _fresh(device)
-    net.eval()
-    for p in net.parameters():
-        p.requires_grad_(False)
-    opt = torch.optim.AdamW([head.weight, bias], lr=1e-3, weight_decay=1e-4)
+    opt = torch.optim.AdamW(
+        [
+            {"params": net.parameters(), "lr": 1e-4},
+            {"params": [head.weight, bias], "lr": 1e-3},
+        ],
+        weight_decay=1e-4,
+    )
     counts = Counter((s[3], s[2]) for s in train_samples)
     weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
@@ -251,6 +254,7 @@ def train_fresh() -> None:
     (OUT / "thresh.json").unlink(missing_ok=True)
     state = None
     for epoch in range(1, 31):
+        net.train()
         total, seen = 0.0, 0
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
