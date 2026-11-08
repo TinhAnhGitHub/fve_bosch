@@ -470,14 +470,38 @@ def fit() -> None:
                 used.add(best_i)
                 pairs.append((image_id, cat, int(gt[image_id][best_i]["freshness_grade"]), p0, p1))
         print(f"fit {start + len(chunk)}/{len(images)} matched {len(pairs)}", flush=True)
+    import numpy as np
+
     base = {c: (0.5, 0.5) for c in range(1, 11)}
-    even = [r for r in pairs if r[0] % 2 == 0]
-    odd = [r for r in pairs if r[0] % 2]
-    print(f"odd base {_macro(odd, base):.4f} fit {_macro(odd, _search(even)):.4f}", flush=True)
-    print(f"even base {_macro(even, base):.4f} fit {_macro(even, _search(odd)):.4f}", flush=True)
-    full = _search(pairs)
-    print(f"all base {_macro(pairs, base):.4f} fit {_macro(pairs, full):.4f}", flush=True)
-    (OUT / "thresh.json").write_text(json.dumps({str(k): list(v) for k, v in full.items()}))
+    hold = set(meta["holdout"])
+    # Meats never sit in the holdout, so a cut fit on them is just the training set.
+    train_rows = [r for r in pairs if r[0] not in hold]
+    hold_rows = [r for r in pairs if r[0] in hold]
+    chosen = _search(train_rows)
+    for cat in range(1, 11):
+        sub = [r for r in pairs if r[1] == cat]
+        if len(sub) < 2:
+            continue
+        yt = np.asarray([r[2] for r in sub])
+        yp = np.asarray([_grade(r[3], r[4], 0.5, 0.5) for r in sub])
+        hsub = [r for r in hold_rows if r[1] == cat]
+        line = f"class {cat} n {len(sub)} base {_qwk(yt, yp):.3f} two {int((np.abs(yt - yp) == 2).sum())}"
+        if len(hsub) >= 8:
+            hyt = np.asarray([r[2] for r in hsub])
+            hb = np.asarray([_grade(r[3], r[4], 0.5, 0.5) for r in hsub])
+            hf = np.asarray([_grade(r[3], r[4], *chosen[cat]) for r in hsub])
+            line += f" hold {_qwk(hyt, hb):.3f}->{_qwk(hyt, hf):.3f} n {len(hsub)}"
+            if _qwk(hyt, hf) <= _qwk(hyt, hb):
+                chosen[cat] = (0.5, 0.5)
+        else:
+            chosen[cat] = (0.5, 0.5)
+        print(line, flush=True)
+    base_s, fit_s = _macro(hold_rows, base), _macro(hold_rows, chosen)
+    print(f"hold n {len(hold_rows)} base {base_s:.4f} fit {fit_s:.4f}", flush=True)
+    if fit_s > base_s:
+        (OUT / "thresh.json").write_text(json.dumps({str(k): list(v) for k, v in chosen.items()}))
+    else:
+        print("keep 0.5", flush=True)
 
 
 def _matched(image_ids, by_image):
