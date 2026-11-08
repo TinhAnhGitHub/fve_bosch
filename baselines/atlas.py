@@ -160,6 +160,57 @@ def cd_l2(pred: torch.Tensor, gt: torch.Tensor, k: int = 2048) -> torch.Tensor:
     return d2.min(2).values.mean() + d2.min(1).values.mean()
 
 
+FLIPS = torch.tensor([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], dtype=torch.float32)
+
+
+def nearest(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> tuple[torch.Tensor, torch.Tensor]:
+    """Squared distance and index of the nearest b for every a. a (n, 3), b (m, 3)."""
+    d, j = [], []
+    for s in range(0, len(a), chunk):
+        v, k = torch.cdist(a[s : s + chunk], b).square().min(1)
+        d.append(v)
+        j.append(k)
+    return torch.cat(d), torch.cat(j)
+
+
+def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024) -> torch.Tensor:
+    """Training loss: exact CD-L2 over every point, at the best PCA sign flip of each target.
+
+    PCA fixes the axes but not their signs: geom.canonicalize picks them by skewness, and
+    a near-symmetric axis flips between similar objects. The grader undoes any rotation,
+    so the loss should not punish a flip either. It takes the minimum over the 4 proper
+    flips, chosen on a 1024-point subsample. Exact nearest neighbours over all 8192
+    points then come from one chunked pass without gradient, and the loss is the plain
+    squared distance to them.
+    """
+    cand = FLIPS.to(gt.device) if flips else FLIPS[:1].to(gt.device)
+    nb, n, m = len(pred), pred.shape[1], gt.shape[1]
+    with torch.no_grad():
+        q = pred.detach()
+        if len(cand) > 1:  # pick the flip on a subsample, all flips in one batched pass
+            ip = torch.randperm(n, device=gt.device)[:pick]
+            ig = torch.randperm(m, device=gt.device)[:pick]
+            g = gt[:, None, ig] * cand[None, :, None, :]
+            d = torch.cdist(q[:, None, ip].expand(-1, len(cand), -1, -1), g).square()
+            best = (d.min(3).values.mean(2) + d.min(2).values.mean(2)).argmin(1)
+        else:
+            best = torch.zeros(nb, dtype=torch.long, device=gt.device)
+        gf = gt * cand[best][:, None, :]
+        j1 = torch.empty((nb, n), dtype=torch.long, device=gt.device)
+        d2 = torch.full((nb, m), float("inf"), device=gt.device)
+        j2 = torch.zeros((nb, m), dtype=torch.long, device=gt.device)
+        for s in range(0, n, chunk):  # exact neighbours over every point, both directions
+            d = torch.cdist(q[:, s : s + chunk], gf).square()
+            j1[:, s : s + chunk] = d.argmin(2)
+            v, k = d.min(1)
+            better = v < d2
+            d2 = torch.where(better, v, d2)
+            j2 = torch.where(better, k + s, j2)
+    to_gt = (pred - torch.gather(gf, 1, j1[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
+    to_pred = (gf - torch.gather(pred, 1, j2[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
+    return (to_gt + to_pred).mean()
+
+
 def _mesh_row(img: str) -> tuple[str, str, np.ndarray]:
     path = Path(img)
     return path.parent.name, path.parent.parent.name, target_points(path.parent / "mesh.ply", N)
@@ -251,7 +302,7 @@ def train(ckpt: Path, epochs: int) -> None:
             b = tr[i : i + batch]
             pred = net(feats[b].to(dev), cat[b].to(dev))
             gt = unit[b].to(dev)
-            loss = cd_l2(pred, gt)
+            loss = chamfer(pred, gt)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -265,7 +316,7 @@ def train(ckpt: Path, epochs: int) -> None:
                 pred = net(feats[b].to(dev), cat[b].to(dev))
                 # shape error in mm^2 at the true size: CD scales with r^2
                 for j, k in enumerate(b):
-                    vtotal += float(cd_l2(pred[j : j + 1], unit[k : k + 1].to(dev), k=8192)) * float(r[k]) ** 2
+                    vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev))) * float(r[k]) ** 2
                 vseen += len(b)
         score = vtotal / vseen
         if score < best_score:
@@ -339,19 +390,6 @@ def predict(ckpt: Path) -> None:
     out = ROOT / "submissions" / "atlas" / "preds_geometry.zip"
     pack(out, clouds)
     print(f"{len(clouds)} clouds -> {out}")
-
-
-FLIPS = torch.tensor([[1, 1, 1], [1, -1, -1], [-1, 1, -1], [-1, -1, 1]], dtype=torch.float32)
-
-
-def nearest(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> tuple[torch.Tensor, torch.Tensor]:
-    """Squared distance and index of the nearest b for every a. a (n, 3), b (m, 3)."""
-    d, j = [], []
-    for s in range(0, len(a), chunk):
-        v, k = torch.cdist(a[s : s + chunk], b).square().min(1)
-        d.append(v)
-        j.append(k)
-    return torch.cat(d), torch.cat(j)
 
 
 def kabsch(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -444,6 +482,8 @@ def fit_check() -> None:
         opt.step()
     last = float(cd_l2(net(feat, cat), target, k=128).detach())
     assert last < first * 0.5, (first, last)
+    flipped = target * torch.tensor([-1.0, -1.0, 1.0])
+    assert float(chamfer(target, flipped)) < 1e-9 < float(chamfer(target, flipped, flips=False))
     print(f"fit check ok  {first:.1f} -> {last:.1f}")
 
 

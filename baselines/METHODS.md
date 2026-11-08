@@ -47,6 +47,11 @@ more than any shape error. Each change below is one commit.
    they save the other half, which would be the full size error. The threshold and the
    share are tuned on every training object with its out-of-fold size and its true
    shape. This comes from our own reasoning and a toy simulation, not from a paper.
+3. **Loss fixes** (`atlas.chamfer`). PCA fixes the axes but not their signs, and a
+   near-symmetric axis flips between similar objects. The grader removes rotation, so the
+   loss takes the minimum over the 4 proper sign flips of the target. It also uses exact
+   nearest neighbours over all 8192 points instead of 2048 random ones per side, and,
+   since change 1, it is computed on size-normalised targets.
 
 Not in this baseline: retrieving a training mesh by image similarity and scaling it.
 That memorizes the training shapes. It is also someone else's leaderboard entry.
