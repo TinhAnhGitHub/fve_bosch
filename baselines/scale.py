@@ -13,14 +13,17 @@ and atlas.py multiplies the unit shape by it. The method is the FVE volume
 pipeline retargeted from log volume to log radius, without its kNN step:
 
   1. Oversized clusters. About 10% of OmniObject3D meshes are 6-13x too large
-     in length. Same rule as the FVE repo: a >= 30x volume gap inside a category
-     (ln 30 / 3 in log radius), or a whole category that far above its group.
+     in length; MetaFood3D scans are not. An Omni object is oversized when it is
+     above a >= 30x volume gap inside its category (the FVE rule, ln 30 / 3 in log
+     radius) or itself 30x above its group's median. The FVE rule flagged whole
+     categories instead, which marked their genuinely small members as oversized.
   2. Category table. Median log radius of each (category, cluster).
   3. Ridge on frozen image features predicts the offset from that median.
   4. Logistic regression gives P(oversized), blended with the category rate.
   5. One number for the metric. Squared Chamfer punishes (s - s_true)^2, so the
      best single size is the posterior MEAN, not the median:
-       s = (1 - p) exp(mu0 + sig0^2 / 2) + p exp(mu1 + sig1^2 / 2)
+       s = (1 - p) exp(mu0 + lam sig0^2 / 2) + p exp(mu1 + lam sig1^2 / 2)
+     lam = 1 is the lognormal mean; it is tuned because sig mixes in label noise.
   6. Settings are picked on 5-fold out-of-fold error in mm^2, mean (s - s_true)^2,
      which weights large objects the way the metric does (not sMAPE).
 
@@ -54,15 +57,16 @@ GAP = np.log(30.0) / 3.0  # the FVE oversized gap, converted from volume to radi
 FVE_FILES = ("dinov2l_reg_518", "dinov3_vith16plus_512")
 CLS_BLOCKS = (0, 2, 4)  # [cls, mean patch] x 3 layers; keep the class tokens
 FOLDS = 5
-ALPHAS = (100.0, 1000.0, 3000.0, 10000.0)
+ALPHAS = (1000.0, 10000.0, 30000.0, 100000.0, 300000.0)
 CS = (0.01, 0.1)
 W_P = (0.0, 0.25, 0.5, 0.75, 1.0)
+LAMS = (0.0, 0.5, 1.0)
 Q_MIN = (0.02, 0.05, 0.1, 0.15, 0.2)
 FRAC = (0.005, 0.01, 0.02, 0.03, 0.05, 0.1)
 
 
-def cluster_labels(y: np.ndarray, cats: np.ndarray, groups: np.ndarray) -> np.ndarray:
-    """u = 1 for oversized: above the largest >= GAP jump in a category, or a whole category GAP above its group."""
+def cluster_labels(y: np.ndarray, cats: np.ndarray, groups: np.ndarray, omni: np.ndarray) -> np.ndarray:
+    """u = 1 for an oversized Omni mesh: above a >= GAP jump in its category, or GAP above its group median."""
     u = np.zeros(len(y), dtype=int)
     for c in np.unique(cats):
         idx = np.flatnonzero(cats == c)
@@ -71,11 +75,8 @@ def cluster_labels(y: np.ndarray, cats: np.ndarray, groups: np.ndarray) -> np.nd
             cut = z[np.argmax(np.diff(z)) + 1]
             u[idx[y[idx] >= cut]] = 1
     base = {g: np.median(y[(groups == g) & (u == 0)]) for g in np.unique(groups)}
-    for c in np.unique(cats):
-        idx = cats == c
-        if np.median(y[idx]) - base[groups[idx][0]] >= GAP:
-            u[idx] = 1
-    return u
+    u[y - np.array([base[g] for g in groups]) >= GAP] = 1
+    return u * omni
 
 
 class Table:
@@ -92,8 +93,8 @@ class Table:
         self.gap = float(np.median([self.med[(c, 1)] - self.med[(c, 0)] for c in both])) if both else 2.0
         self.group = {g: float(np.median(y[(groups == g) & (u == 0)])) for g in np.unique(groups)}
         self.normal = float(np.median(y[u == 0]))
-        self.rate = {c: (float(u[cats == c].sum()) + 0.5) / (float((cats == c).sum()) + 1.0) for c in np.unique(cats)}
         self.prior = float(u.mean())
+        self.rate = {c: (float(u[cats == c].sum()) + self.prior) / (float((cats == c).sum()) + 1.0) for c in np.unique(cats)}
 
     def center(self, cat: str, group: str, k: int) -> float:
         if (cat, k) in self.med:
@@ -178,6 +179,7 @@ def load() -> dict:
         "split": np.array(["train"] * n + ["val"] * len(val_paths)),
         "cats": np.array([p.parent.parent.name for p in train_paths + val_paths]),
         "groups": np.array([p.parent.parent.parent.name for p in train_paths + val_paths]),
+        "omni": np.array([p.parent.name.startswith("omni_") for p in train_paths + val_paths], dtype=int),
         "X": X,
         "y": np.log(radius),
         "n": n,
@@ -193,12 +195,12 @@ def ridge_offsets(A: np.ndarray, t: np.ndarray, B: np.ndarray, alphas) -> dict[f
     return {a: KB @ (proj / (w + a)) + mean for a in alphas}
 
 
-def fold_parts(Xtr, ytr, ctr, gtr, Xte, cte, gte) -> dict:
+def fold_parts(Xtr, ytr, ctr, gtr, otr, Xte, cte, gte) -> dict:
     """Everything one fold needs: cluster centres, ridge offsets per alpha, P(oversized) per C."""
     from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
-    u = cluster_labels(ytr, ctr, gtr)
+    u = cluster_labels(ytr, ctr, gtr, otr)
     table = Table(ytr, ctr, gtr, u)
     centre_tr = table.centers(ctr, gtr)[np.arange(len(ytr)), u]
     sc = StandardScaler().fit(Xtr)
@@ -219,30 +221,31 @@ def combine(parts: dict, alpha: float, C: float, w_p: float) -> tuple[np.ndarray
 
 
 def posterior_mean(p: np.ndarray, mu: np.ndarray, sig: np.ndarray) -> np.ndarray:
+    """Expected linear radius under the two-cluster lognormal; sig already carries lam."""
     return (1.0 - p) * np.exp(mu[:, 0] + sig[0] ** 2 / 2) + p * np.exp(mu[:, 1] + sig[1] ** 2 / 2)
 
 
 def oof_parts(d: dict) -> list[tuple[np.ndarray, dict]]:
     n = d["n"]
-    X, y, cats, groups = d["X"][:n], d["y"], d["cats"][:n], d["groups"][:n]
+    X, y, cats, groups, omni = d["X"][:n], d["y"], d["cats"][:n], d["groups"][:n], d["omni"][:n]
     fold = np.random.default_rng(1).permutation(n) % FOLDS
     out = []
     for f in range(FOLDS):
         te, tr = fold == f, fold != f
-        out.append((te, fold_parts(X[tr], y[tr], cats[tr], groups[tr], X[te], cats[te], groups[te])))
+        out.append((te, fold_parts(X[tr], y[tr], cats[tr], groups[tr], omni[tr], X[te], cats[te], groups[te])))
         print(f"fold {f + 1}/{FOLDS}", flush=True)
     return out
 
 
-def oof(d: dict, parts: list, alpha: float, C: float, w_p: float) -> dict:
+def oof(d: dict, parts: list, alpha: float, C: float, w_p: float, lam: float) -> dict:
     n = d["n"]
     y = d["y"]
     p, mu = np.zeros(n), np.zeros((n, 2))
     for te, part in parts:
         p[te], mu[te] = combine(part, alpha, C, w_p)
-    u = cluster_labels(y, d["cats"][:n], d["groups"][:n])
+    u = cluster_labels(y, d["cats"][:n], d["groups"][:n], d["omni"][:n])
     resid = y - mu[np.arange(n), u]
-    sig = np.array([resid[u == k].std() if (u == k).sum() > 1 else 0.3 for k in (0, 1)])
+    sig = np.array([resid[u == k].std() if (u == k).sum() > 1 else 0.3 for k in (0, 1)]) * np.sqrt(lam)
     return {"p": p, "mu": mu, "sig": sig, "u": u, "s": posterior_mean(p, mu, sig)}
 
 
@@ -265,7 +268,7 @@ def main() -> None:
     d = load()
     n = d["n"]
     r = np.exp(d["y"])
-    u = cluster_labels(d["y"], d["cats"][:n], d["groups"][:n])
+    u = cluster_labels(d["y"], d["cats"][:n], d["groups"][:n], d["omni"][:n])
     print(f"{n} train  {len(d['ids']) - n} val  oversized {u.sum()}  radius median {np.median(r[u == 0]):.1f} mm "
           f"normal, {np.median(r[u == 1]) if u.any() else float('nan'):.1f} mm oversized")
     report("global median", np.full(n, np.median(r)), r, u)
@@ -274,18 +277,20 @@ def main() -> None:
     for alpha in ALPHAS:
         for C in CS:
             for w_p in W_P:
-                res = oof(d, parts, alpha, C, w_p)
-                mm2 = report(f"alpha {alpha:g} C {C:g} w_p {w_p:g}", res["s"], r, u, res["p"])
-                if mm2 < best_mm2:
-                    best, best_mm2 = (alpha, C, w_p, res), mm2
-    alpha, C, w_p, res = best
-    median = (1 - res["p"]) * np.exp(res["mu"][:, 0]) + res["p"] * np.exp(res["mu"][:, 1])
-    print(f"best alpha {alpha:g} C {C:g} w_p {w_p:g}  sig {res['sig'].round(3).tolist()}")
+                for lam in LAMS:
+                    res = oof(d, parts, alpha, C, w_p, lam)
+                    mm2 = report(f"alpha {alpha:g} C {C:g} w_p {w_p:g} lam {lam:g}", res["s"], r, u, res["p"])
+                    if mm2 < best_mm2:
+                        best, best_mm2 = (alpha, C, w_p, lam, res), mm2
+    alpha, C, w_p, lam, res = best
+    hard = np.exp(res["mu"][np.arange(n), (res["p"] >= 0.5).astype(int)])
+    print(f"best alpha {alpha:g} C {C:g} w_p {w_p:g} lam {lam:g}  sig {res['sig'].round(3).tolist()}")
     report("best, posterior mean", res["s"], r, u, res["p"])
-    report("best, no sigma^2/2 term", median, r, u)
+    report("best, likelier cluster only", hard, r, u)
 
     X, cats, groups = d["X"], d["cats"], d["groups"]
-    p_val, mu_val = combine(fold_parts(X[:n], d["y"], cats[:n], groups[:n], X[n:], cats[n:], groups[n:]), alpha, C, w_p)
+    full = fold_parts(X[:n], d["y"], cats[:n], groups[:n], d["omni"][:n], X[n:], cats[n:], groups[n:])
+    p_val, mu_val = combine(full, alpha, C, w_p)
     p = np.concatenate([res["p"], p_val])
     mu = np.concatenate([res["mu"], mu_val])
     OUT.mkdir(parents=True, exist_ok=True)
@@ -299,7 +304,7 @@ def main() -> None:
         s=posterior_mean(p, mu, res["sig"]),
         radius=np.concatenate([r, np.full(len(d["ids"]) - n, np.nan)]),
         u=np.concatenate([u, np.full(len(d["ids"]) - n, -1)]),
-        params=np.array([alpha, C, w_p]),
+        params=np.array([alpha, C, w_p, lam]),
     )
     print(f"train rows are out-of-fold, val rows from the full fit -> {OUT / 'scale.npz'}")
 
