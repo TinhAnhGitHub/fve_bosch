@@ -401,7 +401,10 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str) -> None:
         raise SystemExit("cache has no patch tokens. Run: python baselines/atlas.py cache")
     pts = torch.tensor(z["pts"], dtype=torch.float32)
     r = radii(pts)
-    unit = pts / r[:, None, None] if target == "unit" else pts
+    # the deep decoder's normalised head cannot reach millimetres quickly: it predicts
+    # in units of 40 mm (about the median radius). Still end to end, one global constant.
+    unit_mm = 40.0 if target == "mm" and arch != "atlas" else 1.0
+    unit = pts / r[:, None, None] if target == "unit" else pts / unit_mm
     cat = torch.tensor([vocab[c] for c in z["cats"].tolist()], dtype=torch.long)
     val, tr, rng = holdout(len(feats))
     net = ARCHS[arch](feats.shape[-1], len(vocab)).to(dev)
@@ -440,16 +443,16 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str) -> None:
                 pred = net(feats[b].to(dev), cat[b].to(dev))
                 # shape error in mm^2 at the true size: CD scales with r^2
                 for j, k in enumerate(b):
-                    gain = float(r[k]) ** 2 if target == "unit" else 1.0
+                    gain = float(r[k]) ** 2 if target == "unit" else unit_mm**2
                     vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev))) * gain
                 vseen += len(b)
         score = vtotal / vseen
         if score < best_score:
             best_score = score
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
-        print(f"epoch {epoch}  train {total / seen:.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else ""), flush=True)
+        print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else ""), flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc}, ckpt)
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
@@ -508,7 +511,20 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
     net = ARCHS[blob.get("arch", "atlas")](blob["dim"], len(blob["vocab"])).to(dev).eval()
     net.load_state_dict(blob["state"])
+    if blob.get("unit_mm", 1.0) != 1.0:
+        net = Scaled(net, blob["unit_mm"])
     return net, blob
+
+
+class Scaled(nn.Module):
+    """Multiply a decoder's output by the constant it was trained in (see train)."""
+
+    def __init__(self, net: nn.Module, factor: float) -> None:
+        super().__init__()
+        self.net, self.factor = net, factor
+
+    def forward(self, tok: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
+        return self.net(tok, cat) * self.factor
 
 
 def predict(ckpt: Path, shape: str) -> None:
