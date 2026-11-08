@@ -185,12 +185,12 @@ class _Crops:
         return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.25, jitter: bool = False):
+def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
     import random
 
     x, y, w, h = [float(v) for v in bbox]
     if jitter:
-        pad = random.uniform(0.1, 0.4)
+        pad = random.uniform(0.0, 0.2)
         x += random.uniform(-0.08, 0.08) * w
         y += random.uniform(-0.08, 0.08) * h
     box = (
@@ -553,7 +553,7 @@ def cv() -> None:
     import torch
     import torch.nn.functional as F
     from collections import Counter
-    from torch.utils.data import DataLoader, WeightedRandomSampler
+    from torch.utils.data import DataLoader
     from torchvision import models
 
     samples = group_a_crops()
@@ -603,10 +603,28 @@ def cv() -> None:
         ],
         weight_decay=1e-4,
     )
-    counts = Counter((s[3], s[2]) for s in train_samples)
-    weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-    loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
+    class _Batches:
+        # One crop per photo and three photos per food, so a pack cannot be memorised.
+        def __init__(self, rows):
+            self.by = {}
+            for i, s in enumerate(rows):
+                self.by.setdefault(s[3], {}).setdefault(s[4], []).append(i)
+            self.steps = max(1, len(rows) // 30)
+
+        def __len__(self):
+            return self.steps
+
+        def __iter__(self):
+            for _ in range(self.steps):
+                batch = []
+                for images in self.by.values():
+                    keys = list(images)
+                    for image_id in random.sample(keys, k=min(3, len(keys))):
+                        batch.append(random.choice(images[image_id]))
+                random.shuffle(batch)
+                yield batch
+
+    loader = DataLoader(_Crops(train_samples, True), batch_sampler=_Batches(train_samples), num_workers=0)
     best = -1.0
     (OUT / "thresh.json").unlink(missing_ok=True)
     for epoch in range(1, 31):
