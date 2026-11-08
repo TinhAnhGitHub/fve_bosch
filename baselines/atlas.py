@@ -527,6 +527,52 @@ class Scaled(nn.Module):
         return self.net(tok, cat) * self.factor
 
 
+def mix(clouds: list[np.ndarray], n: int = N) -> np.ndarray:
+    """Point-mix ensemble: an equal share of every model's points, n in total.
+
+    Under squared Chamfer a mix of models that err differently beats each of them:
+    on the holdout, original + new-loss + deep decoder scored 400 mm^2 against 457
+    for the best single model, mostly on the oversized objects (2450 vs 3059).
+    """
+    k = len(clouds)
+    return np.concatenate([c[m::k] for m, c in enumerate(clouds)])[:n]
+
+
+def predict_ensemble(ckpts: list[Path]) -> None:
+    """Millimetre checkpoints only (train --target mm); writes submissions/ensemble."""
+    dev = device()
+    paths = rows("val")
+    if not paths:
+        raise SystemExit("no eval images")
+    tokens: dict[str, list[torch.Tensor]] = {}
+    per_model = []
+    for ckpt in ckpts:
+        net, blob = load_net(ckpt, dev)
+        if blob.get("unit"):
+            raise SystemExit(f"{ckpt} predicts a unit shape; the ensemble needs millimetre models")
+        name = blob.get("encoder", "dinov2b")
+        if name not in tokens:
+            enc = encoder(dev, name)
+            with torch.inference_mode():
+                tokens[name] = [
+                    image_tokens(enc, torch.stack([image_tensor(p, ENCODERS[name]) for p in paths[i : i + 8]]).to(dev)).cpu()
+                    for i in range(0, len(paths), 8)
+                ]
+            del enc
+        vocab = blob["vocab"]
+        out = []
+        with torch.inference_mode():
+            for i, tok in zip(range(0, len(paths), 8), tokens[name]):
+                cat = torch.tensor([vocab.get(p.parent.parent.name, 0) for p in paths[i : i + 8]], dtype=torch.long, device=dev)
+                out.append(net(tok.to(dev), cat).cpu().numpy())
+        per_model.append(np.concatenate(out))
+        print(f"{ckpt.name}: {len(paths)} clouds", flush=True)
+    clouds = {p.parent.name: mix([m[i] for m in per_model]) for i, p in enumerate(paths)}
+    out = ROOT / "submissions" / "ensemble" / "preds_geometry.zip"
+    pack(out, clouds)
+    print(f"{len(clouds)} clouds from {len(ckpts)} models -> {out}")
+
+
 def predict(ckpt: Path, shape: str) -> None:
     dev = device()
     if shape == "retrieve":
@@ -705,7 +751,10 @@ if __name__ == "__main__":
     elif args.cmd == "train":
         train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target)
     elif args.cmd == "predict":
-        predict(args.ckpt[0], args.shape)
+        if len(args.ckpt) > 1:
+            predict_ensemble(args.ckpt)
+        else:
+            predict(args.ckpt[0], args.shape)
     elif args.cmd == "evaluate":
         evaluate(args.ckpt if args.ckpt != [CKPT] or CKPT.exists() else [], args.retrieval)
     else:

@@ -88,3 +88,16 @@ shape: trained in mm, the decoder spreads its points over the sizes it is unsure
 which squared Chamfer rewards. So `train --target mm` (end to end) is the default and
 `--target unit` + scale.py is kept for the size experiments. The hedge still helps any
 unit-shape prediction (819 -> 566).
+
+End-to-end models, same holdout:
+
+| Prediction                                         | CD-L2 mm^2 | median | normal | oversized |
+|----------------------------------------------------|-----------:|-------:|-------:|----------:|
+| original atlas                                     |        457 |     74 |    158 |      3059 |
+| atlas + flip-invariant exact loss (change 3)       |        497 |     89 |    187 |      3201 |
+| deep decoder + new loss (change 5)                 |        570 |     44 |    138 |      4335 |
+| **point mix of all three** (`predict --ckpt a b c`) |    **400** |     67 |    165 |      2450 |
+
+No single change beats the original, but the models err differently and a point mix
+(a third of each model's points) does, by 12%. Two training runs of the same recipe
+disagree by more than 25% in size on 45% of the val objects, which is why mixing helps.
