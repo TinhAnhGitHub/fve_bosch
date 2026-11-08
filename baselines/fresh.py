@@ -316,15 +316,13 @@ def _color(x):
 
 def _logit(net, head, color, bias, x, k):
     import torch
-    import torch.nn.functional as F
 
     index = k if torch.is_tensor(k) else torch.tensor(k, device=x.device)
-    visual = F.dropout(net(x), 0.5, training=net.training)
     cw = color[index]
     if cw.dim() == 1:
         cw = cw.view(1, -1)
     extra = (cw * _color(x)).sum(1, keepdim=True)
-    return head(visual) + extra + bias[index]
+    return head(net(x)) + extra + bias[index]
 
 
 def _load_coral(device):
@@ -516,7 +514,7 @@ def _matched(image_ids, by_image):
                 if best_i is None:
                     continue
                 used.add(best_i)
-                boxes.append((crop, gt[best_i][2], cat))
+                boxes.append((crop, gt[best_i][2], cat, image_id))
     return boxes
 
 
@@ -528,9 +526,16 @@ def _score_boxes(net, head, color, bias, boxes, device):
     x = torch.stack([b[0] for b in boxes]).to(device)
     k = torch.tensor([b[2] - 1 for b in boxes], device=device)
     with torch.no_grad():
-        grade = (torch.sigmoid(_logit(net, head, color, bias, x, k)) > 0.5).sum(1).cpu().numpy()
-    scores, parts = [], []
+        logit = _logit(net, head, color, bias, x, k).cpu().numpy()
     cats = np.asarray([b[2] for b in boxes])
+    images = np.asarray([b[3] for b in boxes])
+    # A pack of meat is one grade. Average the boxes in that photo.
+    for meat in range(6, 11):
+        for image_id in set(images[cats == meat]):
+            sel = (cats == meat) & (images == image_id)
+            logit[sel] = logit[sel].mean(0)
+    grade = (1 / (1 + np.exp(-np.clip(logit, -20, 20))) > 0.5).sum(1)
+    scores, parts = [], []
     true = np.asarray([b[1] for b in boxes])
     for cat in range(1, 11):
         m = cats == cat
@@ -607,7 +612,7 @@ def cv() -> None:
     loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
     best = -1.0
     (OUT / "thresh.json").unlink(missing_ok=True)
-    for epoch in range(1, 31):
+    for epoch in range(1, 41):
         net.train()
         total, seen = 0.0, 0
         for x, y, k in loader:
@@ -688,8 +693,17 @@ def predict() -> None:
     saved = OUT / "thresh.json"
     if saved.is_file():
         thresh = {int(k): tuple(v) for k, v in json.loads(saved.read_text()).items()}
-    from collections import Counter
+    from collections import Counter, defaultdict
 
+    groups = defaultdict(list)
+    for i, r in enumerate(rows):
+        if "_p" in r and r["category_id"] >= 6:
+            groups[(r["image_id"], r["category_id"])].append(i)
+    for idxs in groups.values():
+        p0 = sum(rows[i]["_p"][0] for i in idxs) / len(idxs)
+        p1 = sum(rows[i]["_p"][1] for i in idxs) / len(idxs)
+        for i in idxs:
+            rows[i]["_p"] = (p0, p1)
     for r in rows:
         if "_p" not in r:
             continue
