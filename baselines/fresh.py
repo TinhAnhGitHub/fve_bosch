@@ -8,9 +8,9 @@ Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
 arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
 two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
 a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
-One MobileNetV3-Small readout for every food. The crop is the detector's box,
-one photo at a time, so a pack cannot be memorised. Hand-measured color does
-not survive a new photo.
+One MobileNetV3-Small readout for every food. Two crops of the same food are
+mixed (Zhang, Cisse, Dauphin, Lopez-Paz, 2018), so a grade can sit between
+its neighbors. Hand-measured color does not survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -38,7 +38,7 @@ GROUP_A = {
 
 
 def _det() -> str:
-    found = list((OUT / "det").rglob("best.pt")) or list((OUT / "det").rglob("last.pt"))
+    found = list((OUT / "det").rglob("last.pt")) or list((OUT / "det").rglob("best.pt"))
     if not found:
         raise SystemExit("no detector weights")
     return str(found[0])
@@ -231,7 +231,7 @@ def train_fresh() -> None:
 
     meta = json.loads((OUT / "meta.json").read_text())
     hold = set(meta["holdout"])
-    samples = group_a_crops()
+    samples = group_a_crops() + matched_crops()
     train_samples = [s for s in samples if s[4] not in hold]
     val_samples = [s for s in samples if s[4] in hold]
     if not train_samples:
@@ -250,14 +250,22 @@ def train_fresh() -> None:
     weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
+    (OUT / "thresh.json").unlink(missing_ok=True)
     state = None
     for epoch in range(1, 31):
         net.train()
         total, seen = 0.0, 0
         for x, y, k in loader:
             x, y, k = x.to(device), y.to(device), k.to(device)
+            perm = torch.randperm(len(x), device=device)
+            same = k[perm] == k
+            lam = torch.distributions.Beta(0.4, 0.4).sample((len(x),)).to(device)
+            lam = torch.where(same, lam, torch.ones_like(lam))
+            x = lam[:, None, None, None] * x + (1 - lam)[:, None, None, None] * x[perm]
             logit = _logit(net, head, bias, x, k)
             target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
+            other = torch.stack([(y[perm] > 0).float(), (y[perm] > 1).float()], -1)
+            target = lam[:, None] * target + (1 - lam)[:, None] * other
             loss = F.binary_cross_entropy_with_logits(logit, target)
             opt.zero_grad()
             loss.backward()
@@ -579,7 +587,7 @@ def matched_crops() -> list:
     samples = []
     for start in range(0, len(paths), 8):
         chunk_p, chunk_i = paths[start : start + 8], image_ids[start : start + 8]
-        results = det.predict([str(p) for p in chunk_p], imgsz=IMGSZ, conf=0.001, iou=0.7, max_det=300, verbose=False)
+        results = det.predict([str(p) for p in chunk_p], imgsz=IMGSZ, conf=0.05, iou=0.7, max_det=300, verbose=False)
         for path, iid, result in zip(chunk_p, chunk_i, results):
             if result.boxes is None:
                 continue
