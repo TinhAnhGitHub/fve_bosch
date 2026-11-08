@@ -166,7 +166,7 @@ class _Crops:
     def __init__(self, samples, train: bool):
         from torchvision import transforms
 
-        jitter = [transforms.Resize((300, 300)), transforms.RandomHorizontalFlip()] if train else [transforms.Resize((300, 300))]
+        jitter = [transforms.Resize((224, 224)), transforms.RandomHorizontalFlip()] if train else [transforms.Resize((224, 224))]
         self.tf = transforms.Compose(
             jitter
             + [transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])]
@@ -185,12 +185,12 @@ class _Crops:
         return self.tf(_crop(im, bbox, jitter=self.train)), grade, cat - 1
 
 
-def _crop(im, bbox, pad: float = 0.1, jitter: bool = False):
+def _crop(im, bbox, pad: float = 0.25, jitter: bool = False):
     import random
 
     x, y, w, h = [float(v) for v in bbox]
     if jitter:
-        pad = random.uniform(0.0, 0.2)
+        pad = random.uniform(0.1, 0.4)
         x += random.uniform(-0.08, 0.08) * w
         y += random.uniform(-0.08, 0.08) * h
     box = (
@@ -217,8 +217,8 @@ def train_fresh() -> None:
     if not train_samples:
         raise SystemExit("no Group A crops")
 
-    net = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
-    dim = net.classifier[1].in_features
+    net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+    dim = net.classifier[0].in_features
     net.classifier = torch.nn.Identity()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
@@ -332,7 +332,7 @@ def _load_coral(device):
     blob = torch.load(OUT / "coral.pt", map_location=device, weights_only=True)
     if "color" not in blob:
         raise RuntimeError("old head")
-    net = models.efficientnet_b3(weights=None)
+    net = models.mobilenet_v3_large(weights=None)
     net.classifier = torch.nn.Identity()
     net.load_state_dict(blob["net"])
     head = torch.nn.Linear(blob["head"].shape[1], 1, bias=False)
@@ -588,8 +588,8 @@ def cv() -> None:
         except Exception as exc:
             print("current skipped", type(exc).__name__, flush=True)
     train_samples = [s for s in samples if s[4] not in hold]
-    net = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.DEFAULT)
-    dim = net.classifier[1].in_features
+    net = models.mobilenet_v3_large(weights=models.MobileNet_V3_Large_Weights.DEFAULT)
+    dim = net.classifier[0].in_features
     net.classifier = torch.nn.Identity()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net = net.to(device)
