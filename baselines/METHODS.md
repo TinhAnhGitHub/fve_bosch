@@ -67,3 +67,8 @@ more than any shape error. Each change below is one commit.
    depends only on its own query: training draws a random half of the 8192 queries per
    step against all target points, in bf16, which keeps it at about 0.12 s per batch of
    4 on a 6 GB laptop GPU. Prediction and scoring use all points.
+
+6. **DINOv3 tokens** (`atlas.py cache --encoder dinov3l`, then `train --encoder dinov3l`).
+   DINOv3 ViT-L/16 (Simeoni et al., 2025) at 256 px gives the same 257-token layout
+   (class + 16 x 16 patches, registers dropped) at width 1024. The size head already
+   uses DINOv3-H+ class tokens from the FVE cache.

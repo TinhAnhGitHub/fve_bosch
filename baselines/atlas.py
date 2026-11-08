@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy", "pillow", "torch", "trimesh"]
+# dependencies = ["numpy", "pillow", "torch", "transformers", "trimesh"]
 # ///
 """AtlasNet baseline for Food 3D Reconstruction.
 
@@ -16,6 +16,10 @@ The category vector is learned. It is not a retrieved training mesh.
   uv run baselines/scale.py
   uv run baselines/atlas.py evaluate     # local grader on the 10% holdout
   uv run baselines/atlas.py predict
+
+--encoder dinov3l on cache and train swaps DINOv2-B/14 at 224 for DINOv3-L/16 at
+256 (Simeoni et al., 2025; 256 patches + class token, registers dropped). Its tokens
+go to out/atlas/train_dinov3l.npz; the checkpoint records the encoder.
 
 cache and train use whatever GPU is present. ViT-B/14 at 224 plus this
 decoder fits an L4. CPU still runs, only slower. An A100 is not required.
@@ -41,6 +45,8 @@ CKPT = OUT / "atlas.pt"
 SCALE = ROOT / "baselines" / "out" / "scale" / "scale.npz"
 HEDGE = ROOT / "baselines" / "out" / "scale" / "hedge.json"
 IMAGE = 224
+ENCODERS = {"dinov2b": 224, "dinov3l": 256}  # name -> input size; both give 257 tokens
+DINOV3 = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 N = MIN_POINTS
 PATCHES = 8
 MEAN = (0.485, 0.456, 0.406)
@@ -71,8 +77,8 @@ def rows(split: str) -> list[Path]:
     return sorted(root.rglob("rgb_industrial.png"))
 
 
-def image_tensor(path: Path) -> torch.Tensor:
-    im = Image.open(path).convert("RGB").resize((IMAGE, IMAGE), Image.BICUBIC)
+def image_tensor(path: Path, size: int = IMAGE) -> torch.Tensor:
+    im = Image.open(path).convert("RGB").resize((size, size), Image.BICUBIC)
     x = torch.from_numpy(np.asarray(im)).permute(2, 0, 1).float() / 255.0
     mean = torch.tensor(MEAN)[:, None, None]
     std = torch.tensor(STD)[:, None, None]
@@ -95,8 +101,23 @@ def target_points(mesh_path: Path, n: int) -> np.ndarray:
     return canonicalize(pts).astype(np.float32)
 
 
-def encoder(dev: torch.device) -> nn.Module:
-    net = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+class DinoV3(nn.Module):
+    """Hugging Face DINOv3 returning [class token, patch tokens], registers dropped."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from transformers import AutoModel
+
+        self.net = AutoModel.from_pretrained(DINOV3)
+        self.registers = self.net.config.num_register_tokens
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(pixel_values=x).last_hidden_state
+        return torch.cat([out[:, :1], out[:, 1 + self.registers :]], 1)
+
+
+def encoder(dev: torch.device, name: str = "dinov2b") -> nn.Module:
+    net = DinoV3() if name == "dinov3l" else torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
     net.eval().to(dev)
     for p in net.parameters():
         p.requires_grad_(False)
@@ -104,10 +125,10 @@ def encoder(dev: torch.device) -> nn.Module:
 
 
 @torch.inference_mode()
-def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32) -> np.ndarray:
+def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32, size: int = IMAGE) -> np.ndarray:
     chunks = []
     for i in range(0, len(paths), batch):
-        x = torch.stack([image_tensor(p) for p in paths[i : i + batch]]).to(dev)
+        x = torch.stack([image_tensor(p, size) for p in paths[i : i + batch]]).to(dev)
         chunks.append(image_tokens(net, x).half().cpu())
         print(f"embed {min(i + batch, len(paths))}/{len(paths)}", flush=True)
     return torch.cat(chunks).numpy()
@@ -115,6 +136,8 @@ def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32)
 
 def image_tokens(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Class token plus patch tokens. The class token alone scored 733."""
+    if isinstance(net, DinoV3):
+        return net(x).float()
     out = net.forward_features(x)
     return torch.cat([out["x_norm_clstoken"][:, None], out["x_norm_patchtokens"]], 1).float()
 
@@ -281,7 +304,11 @@ def _mesh_row(img: str) -> tuple[str, str, np.ndarray]:
     return path.parent.name, path.parent.parent.name, target_points(path.parent / "mesh.ply", N)
 
 
-def cache() -> None:
+def cache_path(enc: str) -> Path:
+    return OUT / ("train.npz" if enc == "dinov2b" else f"train_{enc}.npz")
+
+
+def cache(enc: str = "dinov2b") -> None:
     from concurrent.futures import ProcessPoolExecutor
 
     paths = rows("train")
@@ -289,6 +316,16 @@ def cache() -> None:
         raise SystemExit(f"no training images under {data_root()}")
     dev = device()
     saved = OUT / "train.npz"
+    if enc != "dinov2b":
+        if not saved.exists():
+            raise SystemExit(f"run: uv run baselines/atlas.py cache   (the {enc} cache reuses its clouds)")
+        ids = np.load(saved, allow_pickle=False)["ids"]
+        if ids.tolist() != [p.parent.name for p in paths]:
+            raise SystemExit("train.npz is stale. Run: uv run baselines/atlas.py cache")
+        feats = embed(encoder(dev, enc), paths, dev, size=ENCODERS[enc])
+        np.savez(cache_path(enc), ids=ids, feats=feats)
+        print(f"cached {len(ids)}  tokens {feats.shape[1:]}  -> {cache_path(enc)}")
+        return
     if saved.exists():
         z = np.load(saved, allow_pickle=False)
         if z["ids"].tolist() == [p.parent.name for p in paths]:
@@ -322,11 +359,18 @@ def cache() -> None:
     print(f"cached {len(ids)}  dim {feats.shape[1]}  -> {OUT / 'train.npz'}")
 
 
-def _load_cache():
-    path = OUT / "train.npz"
-    if not path.exists():
-        raise SystemExit(f"missing {path}. Run: uv run baselines/atlas.py cache")
-    z = np.load(path, allow_pickle=False)
+def _load_cache(enc: str = "dinov2b") -> tuple[dict, dict[str, int]]:
+    """Clouds, categories and ids from train.npz; image tokens from the encoder's cache."""
+    for path in {OUT / "train.npz", cache_path(enc)}:
+        if not path.exists():
+            raise SystemExit(f"missing {path}. Run: uv run baselines/atlas.py cache --encoder {enc}")
+    with np.load(OUT / "train.npz", allow_pickle=False) as base:
+        z = {k: base[k] for k in base.files if enc == "dinov2b" or k != "feats"}
+    if enc != "dinov2b":
+        with np.load(cache_path(enc), allow_pickle=False) as extra:
+            if extra["ids"].tolist() != z["ids"].tolist():
+                raise SystemExit(f"{cache_path(enc)} is stale. Run: uv run baselines/atlas.py cache --encoder {enc}")
+            z["feats"] = extra["feats"]
     vocab = {c: i for i, c in enumerate(z["vocab"].tolist())}
     return z, vocab
 
@@ -343,8 +387,8 @@ def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
 
-def train(ckpt: Path, epochs: int, arch: str) -> None:
-    z, vocab = _load_cache()
+def train(ckpt: Path, epochs: int, arch: str, enc: str) -> None:
+    z, vocab = _load_cache(enc)
     dev = device()
     feats = torch.tensor(z["feats"], dtype=torch.float32)
     if feats.ndim != 3:
@@ -398,7 +442,7 @@ def train(ckpt: Path, epochs: int, arch: str) -> None:
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
         print(f"epoch {epoch}  train {total / seen:.4f} unit^2  holdout {score:.1f} mm^2 at true size", flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": True, "arch": arch}, ckpt)
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": True, "arch": arch, "encoder": enc}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
@@ -474,7 +518,8 @@ def predict(ckpt: Path, shape: str) -> None:
     table, rule = load_sizes() if blob.get("unit") else (None, None)
     if rule is not None:
         print(f"hedge q_min {rule['q_min']} frac {rule['frac']}")
-    enc = encoder(dev)
+    name = blob.get("encoder", "dinov2b")
+    enc = encoder(dev, name)
     paths = rows("val")
     if not paths:
         raise SystemExit("no eval images")
@@ -484,7 +529,7 @@ def predict(ckpt: Path, shape: str) -> None:
     with torch.inference_mode():
         for i in range(0, len(paths), 8):
             chunk = paths[i : i + 8]
-            tok = image_tokens(enc, torch.stack([image_tensor(p) for p in chunk]).to(dev))
+            tok = image_tokens(enc, torch.stack([image_tensor(p, ENCODERS[name]) for p in chunk]).to(dev))
             cat = torch.tensor(
                 [vocab.get(p.parent.parent.name, unk) for p in chunk],
                 dtype=torch.long,
@@ -574,6 +619,10 @@ def evaluate(ckpts: list[Path], retrieval: bool) -> None:
         score("retrieval", sized(bank / radii(bank)[:, None, None], ids, r, size), gt, big, dev)
     for ckpt in ckpts:
         net, blob = load_net(ckpt, dev)
+        if blob.get("encoder", "dinov2b") != "dinov2b":
+            feats = torch.tensor(_load_cache(blob["encoder"])[0]["feats"][val], dtype=torch.float32)
+        else:
+            feats = torch.tensor(z["feats"][val], dtype=torch.float32)
         with torch.inference_mode():
             pred = torch.cat([net(feats[i : i + 8].to(dev), cat[i : i + 8].to(dev)).cpu() for i in range(0, len(ids), 8)])
         if blob.get("unit"):
@@ -623,13 +672,14 @@ if __name__ == "__main__":
     ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--arch", choices=sorted(ARCHS), default="deep", help="train: decoder (atlas = the original)")
+    ap.add_argument("--encoder", choices=sorted(ENCODERS), default="dinov2b", help="cache, train: image tokens")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
     if args.cmd == "cache":
-        cache()
+        cache(args.encoder)
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder)
     elif args.cmd == "predict":
         predict(args.ckpt[0], args.shape)
     elif args.cmd == "evaluate":
