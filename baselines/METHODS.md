@@ -59,3 +59,11 @@ more than any shape error. Each change below is one commit.
    matches or beats single-view decoders, which mostly recognise and recall. Earlier
    versions of this file ruled retrieval out as memorising; it is kept here as the bar
    the decoder has to clear, and the predict flag makes it a submission if it wins.
+
+5. **Deeper decoder** (`atlas.py train --arch deep`, the default; `--arch atlas` is the
+   original). Four pre-norm blocks of 8-head cross-attention from the points to the
+   image tokens plus an MLP, each with a residual, instead of one single-head attention
+   with no residual or normalisation. No point-to-point self-attention, so each point
+   depends only on its own query: training draws a random half of the 8192 queries per
+   step against all target points, in bf16, which keeps it at about 0.12 s per batch of
+   4 on a 6 GB laptop GPU. Prediction and scoring use all points.

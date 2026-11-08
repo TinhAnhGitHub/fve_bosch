@@ -151,6 +151,71 @@ class Atlas(nn.Module):
         return self.mlp(attn @ self.v(tok))
 
 
+class Block(nn.Module):
+    """Pre-norm cross-attention from points to image tokens, then an MLP, each with a residual."""
+
+    def __init__(self, width: int, heads: int) -> None:
+        super().__init__()
+        self.heads = heads
+        self.norm_q = nn.LayerNorm(width)
+        self.q = nn.Linear(width, width)
+        self.kv = nn.Linear(width, 2 * width)
+        self.proj = nn.Linear(width, width)
+        self.norm_mlp = nn.LayerNorm(width)
+        self.mlp = nn.Sequential(nn.Linear(width, 2 * width), nn.GELU(), nn.Linear(2 * width, width))
+
+    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        b, n, w = x.shape
+        h = self.heads
+        q = self.q(self.norm_q(x)).reshape(b, n, h, w // h).transpose(1, 2)
+        k, v = self.kv(tok).reshape(b, tok.shape[1], 2, h, w // h).permute(2, 0, 3, 1, 4)
+        a = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = x + self.proj(a.transpose(1, 2).reshape(b, n, w))
+        return x + self.mlp(self.norm_mlp(x))
+
+
+class DeepAtlas(Atlas):
+    """Same atlas queries, but depth blocks of multi-head cross-attention with residuals.
+
+    The original decoder is one single-head attention and a 2-layer MLP, with no
+    residual or normalisation: each point gets one look at the image. Here every block
+    lets a point re-read the tokens with what it has already decided, the usual
+    transformer-decoder layout (as in Point-E / LRM-style point and triplane decoders),
+    without point-to-point self-attention, which 8192 queries would make costly.
+    With no self-attention each point depends only on its own query, so training can
+    draw a random subset of the queries (`keep`) and still match all target points.
+    """
+
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8) -> None:
+        super().__init__(dim, n_cat, n, patches)
+        width = self.q.out_features
+        del self.k, self.v, self.mlp
+        self.norm_tok = nn.LayerNorm(dim)
+        self.tok = nn.Linear(dim, width)
+        self.blocks = nn.ModuleList(Block(width, heads) for _ in range(depth))
+        self.out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 3))
+
+    def forward(self, tok: torch.Tensor, cat: torch.Tensor, keep: torch.Tensor | None = None) -> torch.Tensor:
+        b, p, g = tok.shape[0], self.patch.shape[0], self.grid.shape[0]
+        parts = [
+            self.cat(cat)[:, None, None, :].expand(b, p, g, -1),
+            self.patch[None, :, None, :].expand(b, p, g, -1),
+            self.grid[None, None].expand(b, p, g, -1),
+        ]
+        x = torch.cat(parts, -1).reshape(b, p * g, -1)
+        if keep is not None:
+            x = x[:, keep]
+        with torch.autocast(tok.device.type, dtype=torch.bfloat16, enabled=tok.is_cuda):
+            x = self.q(x)
+            t = self.tok(self.norm_tok(tok))
+            for block in self.blocks:
+                x = block(x, t)
+            return self.out(x).float()
+
+
+ARCHS = {"atlas": Atlas, "deep": DeepAtlas}
+
+
 def cd_l2(pred: torch.Tensor, gt: torch.Tensor, k: int = 2048) -> torch.Tensor:
     if pred.shape[1] > k:
         ip = torch.randint(0, pred.shape[1], (k,), device=pred.device)
@@ -278,7 +343,7 @@ def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
 
-def train(ckpt: Path, epochs: int) -> None:
+def train(ckpt: Path, epochs: int, arch: str) -> None:
     z, vocab = _load_cache()
     dev = device()
     feats = torch.tensor(z["feats"], dtype=torch.float32)
@@ -289,8 +354,12 @@ def train(ckpt: Path, epochs: int) -> None:
     unit = pts / r[:, None, None]
     cat = torch.tensor([vocab[c] for c in z["cats"].tolist()], dtype=torch.long)
     val, tr, rng = holdout(len(feats))
-    net = Atlas(feats.shape[-1], len(vocab)).to(dev)
-    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    net = ARCHS[arch](feats.shape[-1], len(vocab)).to(dev)
+    print(f"{arch}: {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M parameters")
+    lr = 1e-3 if arch == "atlas" else 3e-4
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
+    steps = epochs * -(-len(tr) // (4 if dev.type == "cuda" else 2))
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=steps, pct_start=0.05) if arch != "atlas" else None
     batch = 4 if dev.type == "cuda" else 2
     best, best_score = None, float("inf")
     for epoch in range(1, epochs + 1):
@@ -300,12 +369,17 @@ def train(ckpt: Path, epochs: int) -> None:
         seen = 0
         for i in range(0, len(tr), batch):
             b = tr[i : i + batch]
-            pred = net(feats[b].to(dev), cat[b].to(dev))
+            if arch == "atlas":
+                pred = net(feats[b].to(dev), cat[b].to(dev))
+            else:
+                pred = net(feats[b].to(dev), cat[b].to(dev), keep=torch.randperm(N, device=dev)[: N // 2])
             gt = unit[b].to(dev)
             loss = chamfer(pred, gt)
             opt.zero_grad()
             loss.backward()
             opt.step()
+            if sched is not None:
+                sched.step()
             total += float(loss.detach()) * len(b)
             seen += len(b)
         net.eval()
@@ -324,7 +398,7 @@ def train(ckpt: Path, epochs: int) -> None:
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
         print(f"epoch {epoch}  train {total / seen:.4f} unit^2  holdout {score:.1f} mm^2 at true size", flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": True}, ckpt)
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": True, "arch": arch}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
@@ -381,7 +455,7 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
     if not ckpt.exists():
         raise SystemExit(f"missing {ckpt}. Run: uv run baselines/atlas.py train")
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
-    net = Atlas(blob["dim"], len(blob["vocab"])).to(dev).eval()
+    net = ARCHS[blob.get("arch", "atlas")](blob["dim"], len(blob["vocab"])).to(dev).eval()
     net.load_state_dict(blob["state"])
     return net, blob
 
@@ -528,6 +602,16 @@ def fit_check() -> None:
         opt.step()
     last = float(cd_l2(net(feat, cat), target, k=128).detach())
     assert last < first * 0.5, (first, last)
+    deep = DeepAtlas(8, 1, n=128, patches=2, depth=2, heads=4)
+    opt = torch.optim.Adam(deep.parameters(), lr=3e-3)
+    d0 = float(chamfer(deep(feat, cat), target).detach())
+    for _ in range(60):
+        loss = chamfer(deep(feat, cat), target)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+    d1 = float(chamfer(deep(feat, cat), target).detach())
+    assert d1 < d0 * 0.5, (d0, d1)
     flipped = target * torch.tensor([-1.0, -1.0, 1.0])
     assert float(chamfer(target, flipped)) < 1e-9 < float(chamfer(target, flipped, flips=False))
     print(f"fit check ok  {first:.1f} -> {last:.1f}")
@@ -538,13 +622,14 @@ if __name__ == "__main__":
     ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "train", "predict", "evaluate", "check"])
     ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
     ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--arch", choices=sorted(ARCHS), default="deep", help="train: decoder (atlas = the original)")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
     if args.cmd == "cache":
         cache()
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs)
+        train(args.ckpt[0], args.epochs, args.arch)
     elif args.cmd == "predict":
         predict(args.ckpt[0], args.shape)
     elif args.cmd == "evaluate":
