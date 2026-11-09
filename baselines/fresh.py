@@ -5,14 +5,13 @@ Boxes and the 26 food types: YOLO11m (Jocher and Qiu, Ultralytics, 2024),
 COCO-pretrained. 20.1M parameters, so it stays inside the 40M / T4 budget.
 
 Freshness on the 10 Group A foods: CORAL (Cao, Mirjalili, Raschka, 2019,
-arXiv 1901.07884). Three ordered grades, fresh / semi-fresh / spoiled, become
-two shared-weight thresholds. A fresh-to-spoiled miss is a longer jump than
-a fresh-to-semi-fresh miss, which is what quadratic weighted kappa penalises.
-One MobileNetV3-Small trunk for every food, and a separate CORAL direction
-per food. A grape spoils by losing green; a chop spoils by losing red, so one
-shared direction grades grapes backwards. A fifth of each food's photos is
-held out, meats included, and the epoch that grades those photos best is the
-one kept. Hand-measured color does not survive a new photo.
+arXiv 1901.07884). Three ordered grades become two shared-weight thresholds
+on one MobileNetV3-Small trunk. A fresh-to-spoiled miss counts four times a
+one-step miss. The trunk is trained on ground-truth crops and on boxes the
+detector itself produced. A fifth of each food's photos is scored only on
+those detector boxes. The epoch kept is one near the best kappa that makes
+the fewest two-grade misses. The last epoch is not kept just because loss
+is still falling. Hand-measured color does not survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -220,7 +219,7 @@ def _fresh(device):
     dim = net.classifier[0].in_features
     net.classifier = torch.nn.Identity()
     net = net.to(device)
-    head = torch.nn.Linear(dim, 10, bias=False).to(device)
+    head = torch.nn.Linear(dim, 1, bias=False).to(device)
     bias = torch.nn.Parameter(torch.zeros(10, 2, device=device))
     return net, head, bias
 
@@ -231,16 +230,17 @@ def train_fresh() -> None:
     from collections import Counter
     from torch.utils.data import DataLoader, WeightedRandomSampler
 
-    samples = group_a_crops() + matched_crops()
+    matched = matched_crops()
+    samples = group_a_crops() + matched
     hold = _hold_ids(samples)
     train_samples = [s for s in samples if s[4] not in hold]
-    val_samples = [s for s in samples if s[4] in hold]
+    val_samples = [s for s in matched if s[4] in hold]
     held = {}
     for s in val_samples:
         held.setdefault(s[3], 0)
         held[s[3]] += 1
     print("hold", " ".join(f"{c}:{held[c]}" for c in sorted(held)), flush=True)
-    if not train_samples:
+    if not train_samples or not val_samples:
         raise SystemExit("no Group A crops")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,7 +257,8 @@ def train_fresh() -> None:
     sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
     loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
     (OUT / "thresh.json").unlink(missing_ok=True)
-    best, state = -1.0, None
+    (OUT / "coral.pt").unlink(missing_ok=True)
+    history = []
     for epoch in range(1, 31):
         net.train()
         total, seen = 0.0, 0
@@ -271,14 +272,14 @@ def train_fresh() -> None:
             opt.step()
             total += float(loss.detach()) * len(y)
             seen += len(y)
-        score = _holdout_qwk(net, head, bias, val_samples, device)
-        mark = ""
-        if score > best:
-            best, state = score, _state(net, head, bias)
-            mark = " saved"
-        print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {score:.4f}{mark}", flush=True)
-    torch.save(state, OUT / "coral.pt")
-    print(f"saved {OUT / 'coral.pt'} qwk {best:.4f}")
+        qwk, jumps, n, parts = _audit(net, head, bias, val_samples, device)
+        history.append((qwk, jumps, _state(net, head, bias)))
+        print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {qwk:.4f} jumps {jumps}/{n} {parts}", flush=True)
+    peak = max(item[0] for item in history)
+    ranked = [(i, item) for i, item in enumerate(history, start=1) if item[0] >= peak - 0.02]
+    epoch_no, best = min(ranked, key=lambda pair: (pair[1][1], -pair[1][0]))
+    torch.save(best[2], OUT / "coral.pt")
+    print(f"saved epoch {epoch_no} qwk {best[0]:.4f} jumps {best[1]} peak {peak:.4f}", flush=True)
 
 
 def _hold_ids(samples) -> set:
@@ -297,9 +298,7 @@ def _hold_ids(samples) -> set:
     return hold
 
 
-def _holdout_qwk(net, head, bias, samples, device) -> float:
-    if len(samples) < 2:
-        return 0.0
+def _audit(net, head, bias, samples, device):
     import numpy as np
     import torch
 
@@ -313,6 +312,7 @@ def _holdout_qwk(net, head, bias, samples, device) -> float:
             preds.append(grade_hat)
             trues.append(sample[2])
             cats.append(sample[3])
+    jumps = sum(abs(t - p) == 2 for t, p in zip(trues, preds))
     scores, parts = [], []
     for cat in sorted(set(cats)):
         yt = [t for t, c in zip(trues, cats) if c == cat]
@@ -322,8 +322,8 @@ def _holdout_qwk(net, head, bias, samples, device) -> float:
         q = _qwk(np.asarray(yt), np.asarray(yp))
         scores.append(q)
         parts.append(f"{cat}:{q:.2f}/{len(yt)}")
-    print(" ".join(parts), flush=True)
-    return float(sum(scores) / len(scores)) if scores else 0.0
+    qwk = float(sum(scores) / len(scores)) if scores else 0.0
+    return qwk, jumps, len(preds), " ".join(parts)
 
 
 def _qwk(y_true, y_pred, n: int = 3) -> float:
@@ -347,9 +347,7 @@ def _logit(net, head, bias, x, k):
     bb = bias[index]
     if bb.dim() == 1:
         bb = bb.view(1, -1)
-    feat = net(x)
-    score = (feat * head.weight[index]).sum(-1, keepdim=True)
-    return score + bb
+    return head(net(x)) + bb
 
 
 def _state(net, head, bias):
