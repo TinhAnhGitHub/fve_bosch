@@ -48,6 +48,8 @@ IMAGE = 224
 ENCODERS = {"dinov2b": 224, "dinov3l": 256}  # name -> input size; both give 257 tokens
 DINOV3 = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 N = MIN_POINTS
+DENSE = 8 * MIN_POINTS
+DENSE_CACHE = OUT / "train_dense.npz"
 PATCHES = 8
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
@@ -142,21 +144,32 @@ def image_tokens(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return torch.cat([out["x_norm_clstoken"][:, None], out["x_norm_patchtokens"]], 1).float()
 
 
+def fourier_uv(uv: torch.Tensor, harmonics: int) -> torch.Tensor:
+    """uv, r^2 and sin/cos(k * pi * uv) for k <= harmonics: (n, 2) -> (n, 3 + 4 * harmonics).
+
+    Low frequencies only: the decoder already overfits, and high ones can fit mesh noise.
+    """
+    if not harmonics:
+        return uv
+    wave = uv[..., None] * torch.arange(1, harmonics + 1) * torch.pi
+    return torch.cat([uv, uv.square().sum(-1, keepdim=True), wave.sin().flatten(1), wave.cos().flatten(1)], 1)
+
+
 class Atlas(nn.Module):
     """Fold PATCHES grids into N millimetre points, attending to image tokens."""
 
-    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES) -> None:
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, fourier: int = 0) -> None:
         super().__init__()
         g = int((n // patches) ** 0.5)
         if g * g * patches != n:
             raise ValueError(f"{n} is not {patches} square grids")
         axis = torch.linspace(-1.0, 1.0, g)
         yy, xx = torch.meshgrid(axis, axis, indexing="ij")
-        self.register_buffer("grid", torch.stack([xx, yy], -1).reshape(-1, 2))
+        self.register_buffer("grid", fourier_uv(torch.stack([xx, yy], -1).reshape(-1, 2), fourier))
         self.patch = nn.Parameter(torch.randn(patches, 16) * 0.02)
         self.cat = nn.Embedding(n_cat, 32)
         width = 256
-        self.q = nn.Linear(32 + 16 + 2, width)
+        self.q = nn.Linear(32 + 16 + self.grid.shape[1], width)
         self.k = nn.Linear(dim, width)
         self.v = nn.Linear(dim, width)
         self.mlp = nn.Sequential(nn.Linear(width, width), nn.ReLU(), nn.Linear(width, 3))
@@ -187,14 +200,42 @@ class Block(nn.Module):
         self.norm_mlp = nn.LayerNorm(width)
         self.mlp = nn.Sequential(nn.Linear(width, 2 * width), nn.GELU(), nn.Linear(2 * width, width))
 
-    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+    def attend(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
         b, n, w = x.shape
         h = self.heads
         q = self.q(self.norm_q(x)).reshape(b, n, h, w // h).transpose(1, 2)
         k, v = self.kv(tok).reshape(b, tok.shape[1], 2, h, w // h).permute(2, 0, 3, 1, 4)
         a = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-        x = x + self.proj(a.transpose(1, 2).reshape(b, n, w))
+        return self.proj(a.transpose(1, 2).reshape(b, n, w))
+
+    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        x = x + self.attend(x, tok)
         return x + self.mlp(self.norm_mlp(x))
+
+
+class SheetBlock(Block):
+    """Block plus a zero-initialised 3x3 depthwise convolution along each sheet and a per-sheet offset.
+
+    Both start as the identity and add about 2.8k parameters per block: the decoder overfits already.
+    """
+
+    def __init__(self, width: int, heads: int, sheets: int, side: int) -> None:
+        super().__init__(width, heads)
+        self.sheets, self.side = sheets, side
+        self.gate = nn.Parameter(torch.zeros(width))
+        self.conv = nn.Conv2d(width, width, 3, padding=1, groups=width)
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
+
+    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        b, n, w = x.shape
+        s, g = self.sheets, self.side
+        x = x + self.attend(x, tok)
+        sheet = x.reshape(b, s, g * g, w).mean(2, keepdim=True)
+        x = x + (self.gate.to(x.dtype) * (sheet - sheet.mean(1, keepdim=True))).expand(-1, -1, g * g, -1).reshape(b, n, w)
+        x = x + self.mlp(self.norm_mlp(x))
+        near = self.conv(x.reshape(b * s, g, g, w).permute(0, 3, 1, 2))
+        return x + near.permute(0, 2, 3, 1).reshape(b, n, w)
 
 
 class DeepAtlas(Atlas):
@@ -209,8 +250,8 @@ class DeepAtlas(Atlas):
     draw a random subset of the queries (`keep`) and still match all target points.
     """
 
-    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8) -> None:
-        super().__init__(dim, n_cat, n, patches)
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8, fourier: int = 0) -> None:
+        super().__init__(dim, n_cat, n, patches, fourier)
         width = self.q.out_features
         del self.k, self.v, self.mlp
         self.norm_tok = nn.LayerNorm(dim)
@@ -236,7 +277,16 @@ class DeepAtlas(Atlas):
         return self.out(x.float())  # fp32 head: millimetre targets need the precision
 
 
-ARCHS = {"atlas": Atlas, "deep": DeepAtlas}
+class SheetAtlas(DeepAtlas):
+    """DeepAtlas with SheetBlocks. Needs the whole grid, so it cannot subsample queries."""
+
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8, fourier: int = 0) -> None:
+        super().__init__(dim, n_cat, n, patches, depth, heads, fourier)
+        side = int((n // patches) ** 0.5)
+        self.blocks = nn.ModuleList(SheetBlock(self.q.out_features, heads, patches, side) for _ in range(depth))
+
+
+ARCHS = {"atlas": Atlas, "deep": DeepAtlas, "sheet": SheetAtlas}
 
 
 def cd_l2(pred: torch.Tensor, gt: torch.Tensor, k: int = 2048) -> torch.Tensor:
@@ -261,7 +311,7 @@ def nearest(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> tuple[torch.
     return torch.cat(d), torch.cat(j)
 
 
-def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024) -> torch.Tensor:
+def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024, weight: torch.Tensor | None = None) -> torch.Tensor:
     """Training loss: exact CD-L2 over every point, at the best PCA sign flip of each target.
 
     PCA fixes the axes but not their signs: geom.canonicalize picks them by skewness, and
@@ -296,12 +346,32 @@ def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int
             j2 = torch.where(better, k + s, j2)
     to_gt = (pred - torch.gather(gf, 1, j1[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
     to_pred = (gf - torch.gather(pred, 1, j2[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
-    return (to_gt + to_pred).mean()
+    cd = to_gt + to_pred
+    return (cd if weight is None else cd * weight).mean()
 
 
 def _mesh_row(img: str) -> tuple[str, str, np.ndarray]:
     path = Path(img)
     return path.parent.name, path.parent.parent.name, target_points(path.parent / "mesh.ply", N)
+
+
+def _dense_row(img: str) -> np.ndarray:
+    return target_points(Path(img).parent / "mesh.ply", DENSE).astype(np.float32)
+
+
+def cache_dense() -> None:
+    """DENSE surface samples per training object, so --resample can draw fresh targets every step."""
+    from concurrent.futures import ProcessPoolExecutor
+
+    paths = rows("train")
+    with np.load(OUT / "train.npz", allow_pickle=False) as z:
+        ids = z["ids"]
+    if ids.tolist() != [p.parent.name for p in paths]:
+        raise SystemExit("train.npz is stale. Run: uv run baselines/atlas.py cache")
+    with ProcessPoolExecutor() as pool:
+        pts = list(pool.map(_dense_row, map(str, paths), chunksize=16))
+    np.savez(DENSE_CACHE, ids=ids, pts=np.stack(pts))
+    print(f"cached {len(ids)} objects x {DENSE} points -> {DENSE_CACHE}")
 
 
 def cache_path(enc: str) -> Path:
@@ -387,7 +457,7 @@ def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
 
-def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False) -> None:
+def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False) -> None:
     """target unit: shape only, size from scale.py. target mm: shape and size end to end.
 
     On the 10% holdout the end-to-end model beat every unit shape x predicted size
@@ -416,7 +486,22 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         normal = np.array([flag[i] == 0 for i in z["ids"].tolist()])
         tr, val = tr[normal[tr]], val[normal[val]]
         print(f"drop oversized: train {len(tr)}, holdout {len(val)} normal objects")
-    net = ARCHS[arch](feats.shape[-1], len(vocab)).to(dev)
+    weight = None
+    if reweight_oversized:  # true millimetres, but flagged objects pull on the loss like a typical object
+        with np.load(SCALE, allow_pickle=False) as s:
+            flag = dict(zip(s["ids"].tolist(), s["u"].tolist()))
+        over = np.array([flag[i] != 0 for i in z["ids"].tolist()])
+        typical = float(r[torch.from_numpy(~over)].median())
+        weight = torch.where(torch.from_numpy(over), (typical / r).square().clamp(max=1.0), torch.ones_like(r))
+        val = val[~over[val]]
+        print(f"reweight oversized: {int(over[tr].sum())} of {len(tr)} training objects, holdout {len(val)} normal objects")
+    dense = None
+    if resample:  # fresh surface points every step instead of the same 8192
+        with np.load(DENSE_CACHE, allow_pickle=False) as d:
+            if d["ids"].tolist() != z["ids"].tolist():
+                raise SystemExit(f"{DENSE_CACHE} is stale. Run: uv run baselines/atlas.py dense")
+            dense = torch.from_numpy(d["pts"]) / unit_mm
+    net = ARCHS[arch](feats.shape[-1], len(vocab), fourier=fourier).to(dev)
     print(f"{arch}: {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M parameters")
     lr = 1e-3 if arch == "atlas" else 3e-4
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
@@ -431,12 +516,16 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         seen = 0
         for i in range(0, len(tr), batch):
             b = tr[i : i + batch]
-            if arch == "atlas":
-                pred = net(feats[b].to(dev), cat[b].to(dev))
+            tok = feats[b]
+            if token_drop:  # the class token stays; a random share of the patch tokens does not
+                kept = torch.randperm(tok.shape[1] - 1)[: int((tok.shape[1] - 1) * (1 - token_drop))] + 1
+                tok = tok[:, torch.cat([torch.zeros(1, dtype=torch.long), kept])]
+            if arch == "deep" and not all_queries:
+                pred = net(tok.to(dev), cat[b].to(dev), keep=torch.randperm(N, device=dev)[: N // 2])
             else:
-                pred = net(feats[b].to(dev), cat[b].to(dev), keep=torch.randperm(N, device=dev)[: N // 2])
-            gt = unit[b].to(dev)
-            loss = chamfer(pred, gt)
+                pred = net(tok.to(dev), cat[b].to(dev))
+            gt = (unit[b] if dense is None else dense[b][:, torch.randperm(DENSE)[:N]]).to(dev)
+            loss = chamfer(pred, gt, flips=flips, weight=None if weight is None else weight[b].to(dev))
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -453,7 +542,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
                 # shape error in mm^2 at the true size: CD scales with r^2
                 for j, k in enumerate(b):
                     gain = float(r[k]) ** 2 if target == "unit" else unit_mm**2
-                    vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev))) * gain
+                    vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev), flips=flips)) * gain
                 vseen += len(b)
         score = vtotal / vseen
         if score < best_score:
@@ -461,7 +550,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
         print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else ""), flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm}, ckpt)
+    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
 
 
@@ -518,7 +607,7 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
     if not ckpt.exists():
         raise SystemExit(f"missing {ckpt}. Run: uv run baselines/atlas.py train")
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
-    net = ARCHS[blob.get("arch", "atlas")](blob["dim"], len(blob["vocab"])).to(dev).eval()
+    net = ARCHS[blob.get("arch", "atlas")](blob["dim"], len(blob["vocab"]), fourier=blob.get("fourier", 0)).to(dev).eval()
     net.load_state_dict(blob["state"])
     if blob.get("unit_mm", 1.0) != 1.0:
         net = Scaled(net, blob["unit_mm"])
@@ -746,21 +835,29 @@ def fit_check() -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "train", "predict", "evaluate", "check"])
+    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "dense", "train", "predict", "evaluate", "check"])
     ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--arch", choices=sorted(ARCHS), default="deep", help="train: decoder (atlas = the original)")
     ap.add_argument("--encoder", choices=sorted(ENCODERS), default="dinov2b", help="cache, train: image tokens")
     ap.add_argument("--target", choices=["mm", "unit"], default="mm", help="train: millimetre clouds, or unit shape for scale.py")
     ap.add_argument("--seed", type=int, default=0, help="train: init and shuffle seed (holdout split is fixed)")
+    ap.add_argument("--no-flip-loss", action="store_true", help="train: score the target as canonicalised, without searching its PCA sign flips")
+    ap.add_argument("--fourier", type=int, default=0, help="train: low harmonics of the sheet coordinates, plus r^2 (0 = raw uv)")
+    ap.add_argument("--resample", action="store_true", help="train: draw fresh target points from the dense cache every step (run: dense)")
+    ap.add_argument("--token-drop", type=float, default=0.0, help="train: share of patch tokens hidden from the decoder each step")
+    ap.add_argument("--all-queries", action="store_true", help="train: deep decoder on all queries instead of a random half")
+    ap.add_argument("--reweight-oversized", action="store_true", help="train: keep oversized objects, capping their loss at a typical object's")
     ap.add_argument("--drop-oversized", action="store_true", help="train: leave oversized objects out of training and of the holdout check")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
     if args.cmd == "cache":
         cache(args.encoder)
+    elif args.cmd == "dense":
+        cache_dense()
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized)
     elif args.cmd == "predict":
         if len(args.ckpt) > 1:
             predict_ensemble(args.ckpt)
