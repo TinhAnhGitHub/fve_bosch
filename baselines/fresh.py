@@ -10,8 +10,9 @@ on one MobileNetV3-Small trunk. A fresh-to-spoiled miss counts four times a
 one-step miss. The trunk is trained on ground-truth crops and on boxes the
 detector itself produced. A fifth of each food's photos is scored only on
 those detector boxes. The epoch kept is one near the best kappa that makes
-the fewest two-grade misses. The last epoch is not kept just because loss
-is still falling. Hand-measured color does not survive a new photo.
+the fewest two-grade misses. That checkpoint is dropped, and the same number
+of epochs is trained again on every photo. The last epoch is not kept just
+because loss is still falling. Hand-measured color does not survive a new photo.
 
 Group B gets a box and a type only. Freshness is left null.
 """
@@ -224,11 +225,49 @@ def _fresh(device):
     return net, head, bias
 
 
-def train_fresh() -> None:
+def _opt(net, head, bias):
     import torch
-    import torch.nn.functional as F
+
+    return torch.optim.AdamW(
+        [
+            {"params": net.parameters(), "lr": 1e-4},
+            {"params": [head.weight, bias], "lr": 1e-3},
+        ],
+        weight_decay=1e-4,
+    )
+
+
+def _loader(samples):
     from collections import Counter
     from torch.utils.data import DataLoader, WeightedRandomSampler
+
+    counts = Counter((s[3], s[2]) for s in samples)
+    weights = [1.0 / counts[(s[3], s[2])] for s in samples]
+    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+    return DataLoader(_Crops(samples, True), batch_size=32, sampler=sampler, num_workers=0)
+
+
+def _epoch(net, head, bias, opt, loader, device) -> float:
+    import torch
+    import torch.nn.functional as F
+
+    net.train()
+    total, seen = 0.0, 0
+    for x, y, k in loader:
+        x, y, k = x.to(device), y.to(device), k.to(device)
+        logit = _logit(net, head, bias, x, k)
+        target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
+        loss = F.binary_cross_entropy_with_logits(logit, target)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        total += float(loss.detach()) * len(y)
+        seen += len(y)
+    return total / seen
+
+
+def train_fresh() -> None:
+    import torch
 
     matched = matched_crops()
     samples = group_a_crops() + matched
@@ -245,41 +284,52 @@ def train_fresh() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     net, head, bias = _fresh(device)
-    opt = torch.optim.AdamW(
-        [
-            {"params": net.parameters(), "lr": 1e-4},
-            {"params": [head.weight, bias], "lr": 1e-3},
-        ],
-        weight_decay=1e-4,
-    )
-    counts = Counter((s[3], s[2]) for s in train_samples)
-    weights = [1.0 / counts[(s[3], s[2])] for s in train_samples]
-    sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-    loader = DataLoader(_Crops(train_samples, True), batch_size=32, sampler=sampler, num_workers=0)
+    loader = _loader(train_samples)
     (OUT / "thresh.json").unlink(missing_ok=True)
     (OUT / "coral.pt").unlink(missing_ok=True)
     history = []
+    opt = _opt(net, head, bias)
     for epoch in range(1, 31):
-        net.train()
-        total, seen = 0.0, 0
-        for x, y, k in loader:
-            x, y, k = x.to(device), y.to(device), k.to(device)
-            logit = _logit(net, head, bias, x, k)
-            target = torch.stack([(y > 0).float(), (y > 1).float()], -1)
-            loss = F.binary_cross_entropy_with_logits(logit, target)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            total += float(loss.detach()) * len(y)
-            seen += len(y)
+        loss = _epoch(net, head, bias, opt, loader, device)
         qwk, jumps, n, parts = _audit(net, head, bias, val_samples, device)
-        history.append((qwk, jumps, _state(net, head, bias)))
-        print(f"epoch {epoch} loss {total / seen:.4f} holdout_qwk {qwk:.4f} jumps {jumps}/{n} {parts}", flush=True)
+        history.append((qwk, jumps))
+        print(f"epoch {epoch} loss {loss:.4f} holdout_qwk {qwk:.4f} jumps {jumps}/{n} {parts}", flush=True)
     peak = max(item[0] for item in history)
     ranked = [(i, item) for i, item in enumerate(history, start=1) if item[0] >= peak - 0.02]
     epoch_no, best = min(ranked, key=lambda pair: (pair[1][1], -pair[1][0]))
-    torch.save(best[2], OUT / "coral.pt")
-    print(f"saved epoch {epoch_no} qwk {best[0]:.4f} jumps {best[1]} peak {peak:.4f}", flush=True)
+    last_jumps = history[-1][1]
+    print(
+        f"audit epoch {epoch_no} qwk {best[0]:.4f} jumps {best[1]} peak {peak:.4f} last_jumps {last_jumps}",
+        flush=True,
+    )
+    if not (8 <= epoch_no <= 29 and best[1] < last_jumps and best[0] >= 0.52):
+        print("stop", flush=True)
+        return
+    refit(epoch_no, samples)
+
+
+def refit(epochs: int, samples=None) -> None:
+    import torch
+
+    if not 8 <= epochs <= 29:
+        raise SystemExit("refit epoch out of range")
+    if samples is None:
+        samples = group_a_crops() + matched_crops()
+    if not samples:
+        raise SystemExit("no Group A crops")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    net, head, bias = _fresh(device)
+    loader = _loader(samples)
+    (OUT / "thresh.json").unlink(missing_ok=True)
+    (OUT / "coral.pt").unlink(missing_ok=True)
+    print(f"refit {epochs} epochs on {len(samples)} crops", flush=True)
+    opt = _opt(net, head, bias)
+    loss = 0.0
+    for epoch in range(1, epochs + 1):
+        loss = _epoch(net, head, bias, opt, loader, device)
+        print(f"refit epoch {epoch} loss {loss:.4f}", flush=True)
+    torch.save(_state(net, head, bias), OUT / "coral.pt")
+    print(f"saved refit epoch {epochs}", flush=True)
 
 
 def _hold_ids(samples) -> set:
@@ -829,6 +879,10 @@ def main() -> None:
         train_det()
     elif cmd == "fresh":
         train_fresh()
+    elif cmd == "refit":
+        if len(sys.argv) < 3:
+            raise SystemExit("usage: fresh.py refit EPOCHS")
+        refit(int(sys.argv[2]))
     elif cmd == "fit":
         fit()
     elif cmd == "cv":
@@ -836,7 +890,7 @@ def main() -> None:
     elif cmd == "predict":
         predict()
     else:
-        raise SystemExit("usage: fresh.py prep|train|fresh|fit|cv|predict")
+        raise SystemExit("usage: fresh.py prep|train|fresh|refit|fit|cv|predict")
 
 
 if __name__ == "__main__":
