@@ -87,7 +87,7 @@ class ResBlock(nn.Module):
 
 
 class Head(nn.Module):
-    def __init__(self, d_in: int, d_sum: int, n_levels: int, c: int = 128, p_drop: float = 0.1) -> None:
+    def __init__(self, d_in: int, d_sum: int, n_levels: int, n_out: int, c: int = 128, p_drop: float = 0.1) -> None:
         super().__init__()
         self.proj = nn.ModuleList([nn.Conv2d(d_in, c, 1) for _ in range(n_levels)])
         self.stem = nn.Sequential(nn.Conv2d(c + 2, c, 3, padding=1), nn.GroupNorm(8, c), nn.GELU())
@@ -97,7 +97,7 @@ class Head(nn.Module):
         self.pool = nn.MultiheadAttention(c, 4, batch_first=True)
         self.drop2d = nn.Dropout2d(p_drop)
         d = d_sum + 4 * c
-        self.mlp = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 512), nn.GELU(), nn.Dropout(p_drop), nn.Linear(512, 2 + N_AUX))
+        self.mlp = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 512), nn.GELU(), nn.Dropout(p_drop), nn.Linear(512, n_out))
         v = torch.linspace(-1, 1, GRID)
         self.register_buffer("uv", torch.stack(torch.meshgrid(v, v, indexing="ij"))[None], persistent=False)
 
@@ -109,6 +109,61 @@ class Head(nn.Module):
         tok = g.flatten(2).transpose(1, 2)
         pooled, _ = self.pool(self.queries.expand(tok.shape[0], -1, -1), tok, tok)
         return self.mlp(torch.cat([summary, pooled.flatten(1)], 1))
+
+
+class XBlock(nn.Module):
+    """f3dr atlas.Block (pre-norm cross-attention to the image tokens + MLP, residuals) plus self-attention among the
+    queries, so the measurements can read each other (few queries, so it is cheap)."""
+
+    def __init__(self, w: int, heads: int, p_drop: float) -> None:
+        super().__init__()
+        self.n1, self.n2, self.n3 = nn.LayerNorm(w), nn.LayerNorm(w), nn.LayerNorm(w)
+        self.sa = nn.MultiheadAttention(w, heads, dropout=p_drop, batch_first=True)
+        self.ca = nn.MultiheadAttention(w, heads, dropout=p_drop, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(w, 2 * w), nn.GELU(), nn.Dropout(p_drop), nn.Linear(2 * w, w))
+
+    def forward(self, x: torch.Tensor, mem: torch.Tensor) -> torch.Tensor:
+        h = self.n1(x)
+        x = x + self.sa(h, h, h, need_weights=False)[0]
+        x = x + self.ca(self.n2(x), mem, mem, need_weights=False)[0]
+        return x + self.mlp(self.n3(x))
+
+
+def sincos_2d(g: int, w: int) -> torch.Tensor:
+    """Fixed 2D sine-cosine position code for a g x g token grid, [g*g, w] (w divisible by 4)."""
+    v = torch.arange(g, dtype=torch.float32)
+    yy, xx = torch.meshgrid(v, v, indexing="ij")
+    f = 1.0 / 10000 ** (torch.arange(w // 4, dtype=torch.float32) / (w // 4))
+    a, b = yy.flatten()[:, None] * f, xx.flatten()[:, None] * f
+    return torch.cat([a.sin(), a.cos(), b.sin(), b.cos()], 1)
+
+
+class QueryDecoder(nn.Module):
+    """Encoder-decoder head (f3dr DeepAtlas retargeted): one learned query per output value [r, oversized logit, aux...]
+    attends to the fused multi-depth patch tokens (MoGe-2 style per-layer projection + sum, as Head) plus the CLS/mean
+    summary token. f3dr queries are 8192 surface points; FVE queries are measurements. Zero-initialised readout: the
+    first prediction is the cluster constant (r = 0, logit 0)."""
+
+    def __init__(self, d_in: int, d_sum: int, n_levels: int, n_out: int, w: int = 256, depth: int = 4, heads: int = 8,
+                 p_drop: float = 0.1) -> None:
+        super().__init__()
+        self.proj = nn.ModuleList([nn.Linear(d_in, w) for _ in range(n_levels)])
+        self.sum_in = nn.Linear(d_sum, w)
+        self.norm_mem = nn.LayerNorm(w)
+        self.queries = nn.Parameter(torch.randn(n_out, w) * 0.02)
+        self.blocks = nn.ModuleList([XBlock(w, heads, p_drop) for _ in range(depth)])
+        self.norm = nn.LayerNorm(w)
+        self.out_w = nn.Parameter(torch.zeros(n_out, w))
+        self.out_b = nn.Parameter(torch.zeros(n_out))
+        self.register_buffer("pos", sincos_2d(GRID, w), persistent=False)
+
+    def forward(self, feats: list[torch.Tensor], summary: torch.Tensor) -> torch.Tensor:
+        mem = sum(p(f.flatten(2).transpose(1, 2)) for p, f in zip(self.proj, feats)) + self.pos
+        mem = self.norm_mem(torch.cat([self.sum_in(summary)[:, None], mem], 1))
+        x = self.queries.expand(mem.shape[0], -1, -1)
+        for blk in self.blocks:
+            x = blk(x, mem)
+        return (self.norm(x) * self.out_w).sum(-1) + self.out_b
 
 
 IM_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -123,7 +178,8 @@ def amp_dtype(dtype: torch.dtype):
 class Net(nn.Module):
     """backbone 'radio' (C-RADIOv4-H, local code) or 'dinov3' (HF DINOv3 ViT-L/16): LoRA + multi-layer conv head."""
 
-    def __init__(self, model_dir: str, backbone: str, dtype: torch.dtype, last_only: bool, lora_r: int, drop_path: float) -> None:
+    def __init__(self, model_dir: str, backbone: str, dtype: torch.dtype, last_only: bool, lora_r: int, drop_path: float,
+                 head: str = "conv", n_out: int = 2 + N_AUX) -> None:
         super().__init__()
         self.kind = backbone
         if backbone == "radio":
@@ -154,7 +210,8 @@ class Net(nn.Module):
                 p.data = p.data.float()
         with torch.no_grad():
             _, s = self.encode(torch.zeros(1, 3, SIZE, SIZE, device="cuda", dtype=dtype))
-        self.head = Head(d, s.shape[-1], len(self.taps)).cuda()
+        cls = QueryDecoder if head == "decoder" else Head
+        self.head = cls(d, s.shape[-1], len(self.taps), n_out).cuda()
 
     def encode(self, x: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
         n = GRID * GRID
@@ -212,6 +269,7 @@ def main() -> None:
     ap.add_argument("--label-smooth", type=float, default=0.0, help="smoothing on the oversized-mode BCE target")
     ap.add_argument("--scale-aug", type=float, default=0.0, help="+- scale jitter, e.g. 0.15")
     ap.add_argument("--drop-path", type=float, default=0.0, help="stochastic depth (dinov3 backbone only)")
+    ap.add_argument("--head", default="conv", choices=["conv", "decoder"], help="conv head (B4.1/B4.2) or query decoder (B6)")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--data", default="/kaggle/input/fve-bosch-data")
     ap.add_argument("--prep", default="/kaggle/input/fve-b42-prep")
@@ -235,7 +293,7 @@ def main() -> None:
 
     torch.manual_seed(a.fold)
     rng = np.random.default_rng(a.fold)
-    net = Net(a.model, a.backbone, dtype, a.last_only, a.lora_r, a.drop_path)
+    net = Net(a.model, a.backbone, dtype, a.last_only, a.lora_r, a.drop_path, a.head, 2 + d["aux"].shape[1])
     lora = [p for p in net.backbone.parameters() if p.requires_grad]
     head_p = list(net.head.parameters())
     print(f"taps {net.taps}; trainable LoRA {sum(p.numel() for p in lora) / 1e6:.2f}M + head "
@@ -318,6 +376,9 @@ def main() -> None:
     out_q, out_v = predict(net, imgs_q, dtype), predict(net, imgs_v, dtype)
     sm = smape(q_y, decode(out_q, q_b0, q_b1))
     print(f"\nFINAL fold {a.fold}: held-out sMAPE (EMA weights) {sm:.2f}", flush=True)
+    if "aux_mean" in d:  # aux = [3 sorted ln bbox dims (cm), ln fill, ...]: their sum is ln volume, with no category table
+        geo = (out_q[:, 2:6] * d["aux_std"][:4] + d["aux_mean"][:4]).sum(1)
+        print(f"geometric readout (dims + fill, category-free) sMAPE {smape(q_y, geo):.2f}", flush=True)
     np.savez(out_dir / "preds.npz", va_idx=d["va_idx"], out_heldout=out_q, out_val=out_v, history=np.array(hist))
     if not a.smoke:
         torch.save({n: p.detach().cpu() for n, p in named.items()}, out_dir / "trainable_ema.pt")

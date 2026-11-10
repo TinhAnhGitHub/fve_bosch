@@ -3,8 +3,10 @@
 # dependencies = ["numpy", "pandas", "scikit-learn", "scipy"]
 # ///
 """Export everything the Kaggle trainer needs (no repo imports on Kaggle): row lists, per-fold training targets
-(r, ok, oversized label, mixed mask, standardised aux = 3 sorted ln bbox dims + ln fill + 4 mesh descriptors),
-and decode tables (base ln values) for held-out and val rows. Seed-0 folds, identical to B4.0 splits.
+(r, ok, oversized label, mixed mask, standardised aux = 3 sorted ln bbox dims + ln fill [+ 4 mesh descriptors]),
+aux mean/std (to undo the standardisation), and decode tables (base ln values) for held-out and val rows.
+Seed-0 folds, identical to B4.0 splits. The FVE download has no mesh.ply: the mesh descriptors are added only when
+features/mesh_targets.npz exists (built from the F3DR track's meshes; check the rules before using it).
 Output: kaggle_pkg/b42_prep/{rows.csv, fold{f}.npz}
 """
 import json, math, sys
@@ -19,9 +21,14 @@ from frozen import Experiment
 GAP = math.log(30.0)
 OUT = ROOT / "kaggle_pkg" / "b42_prep"; OUT.mkdir(parents=True, exist_ok=True)
 exp = Experiment()
-mt = np.load(ROOT / "features" / "mesh_targets.npz", allow_pickle=True)
-assert (mt["ids"] == exp.train["sample_id"].to_numpy()).all()
-MESH = mt["X"]
+MT = ROOT / "features" / "mesh_targets.npz"
+if MT.exists() and "--no-mesh" not in sys.argv:
+    mt = np.load(MT, allow_pickle=True)
+    assert (mt["ids"] == exp.train["sample_id"].to_numpy()).all()
+    MESH = mt["X"]
+else:
+    MESH = np.zeros((len(exp.train), 0))
+print("mesh descriptors", MESH.shape[1])
 
 rows = pd.concat([exp.train.assign(split="train")[["split", "group", "category", "sample_id"]],
                   exp.val.assign(split="val")[["split", "group", "category", "sample_id"]]])
@@ -52,10 +59,11 @@ for f, (tr_idx, va_idx) in enumerate(exp.splits(0)):
     dims = np.log(np.sort(np.array([gt[s]["bbox_mm"] for s in T["sample_id"]]), axis=1) / 10)
     fill = np.log(T["volume"].to_numpy() / np.prod(np.exp(dims), axis=1))
     aux = np.column_stack([dims, fill, MESH[tr_idx]])
-    aux = (aux - aux.mean(0)) / (aux.std(0) + 1e-6)
+    aux_mean, aux_std = aux.mean(0), aux.std(0) + 1e-6
+    aux = (aux - aux_mean) / aux_std
     q0, q1 = base_values(table, Q["category"].to_numpy())
     np.savez(OUT / f"fold{f}.npz", tr_idx=tr_idx, va_idx=va_idx, r=np.nan_to_num(r), ok=ok, u=u.astype(np.float32),
              mixed=mixed, aux=aux.astype(np.float32), q_base0=q0, q_base1=q1, q_y=Q["volume"].to_numpy(),
-             val_base0=v0, val_base1=v1)
+             val_base0=v0, val_base1=v1, aux_mean=aux_mean, aux_std=aux_std)
     print(f"fold {f}: train {len(T)} held-out {len(Q)} aux {aux.shape} ok {ok.mean():.3f} mixed {mixed.mean():.3f}")
 print("rows", len(rows), "train", n_tr, "val", len(exp.val))
