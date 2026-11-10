@@ -28,6 +28,7 @@ decoder fits an L4. CPU still runs, only slower. An A100 is not required.
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 from pathlib import Path
 
@@ -45,7 +46,7 @@ CKPT = OUT / "atlas.pt"
 SCALE = ROOT / "baselines" / "out" / "scale" / "scale.npz"
 HEDGE = ROOT / "baselines" / "out" / "scale" / "hedge.json"
 IMAGE = 224
-ENCODERS = {"dinov2b": 224, "dinov3l": 256}  # name -> input size; both give 257 tokens
+ENCODERS = {"dinov2b": 224, "dinov3l": 256, "dinov3l_ml": 256, "dinov3l384": 384}  # name -> input size; 257 tokens, 577 at 384 px
 DINOV3 = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 N = MIN_POINTS
 DENSE = 8 * MIN_POINTS
@@ -79,12 +80,13 @@ def rows(split: str) -> list[Path]:
     return sorted(root.rglob("rgb_industrial.png"))
 
 
-def image_tensor(path: Path, size: int = IMAGE) -> torch.Tensor:
+def image_tensor(path: Path, size: int = IMAGE, flip: bool = False) -> torch.Tensor:
     im = Image.open(path).convert("RGB").resize((size, size), Image.BICUBIC)
     x = torch.from_numpy(np.asarray(im)).permute(2, 0, 1).float() / 255.0
     mean = torch.tensor(MEAN)[:, None, None]
     std = torch.tensor(STD)[:, None, None]
-    return (x - mean) / std
+    x = (x - mean) / std
+    return x.flip(2) if flip else x
 
 
 def target_points(mesh_path: Path, n: int) -> np.ndarray:
@@ -106,20 +108,24 @@ def target_points(mesh_path: Path, n: int) -> np.ndarray:
 class DinoV3(nn.Module):
     """Hugging Face DINOv3 returning [class token, patch tokens], registers dropped."""
 
-    def __init__(self) -> None:
+    def __init__(self, layers: tuple[int, ...] = ()) -> None:
         super().__init__()
         from transformers import AutoModel
 
         self.net = AutoModel.from_pretrained(DINOV3)
         self.registers = self.net.config.num_register_tokens
+        self.layers = layers  # also average these hidden layers (each layer-normalised) with the last one
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.net(pixel_values=x).last_hidden_state
+        res = self.net(pixel_values=x, output_hidden_states=bool(self.layers))
+        out = res.last_hidden_state
+        if self.layers:
+            out = torch.stack([out, *(self.net.norm(res.hidden_states[i]) for i in self.layers)]).mean(0)
         return torch.cat([out[:, :1], out[:, 1 + self.registers :]], 1)
 
 
 def encoder(dev: torch.device, name: str = "dinov2b") -> nn.Module:
-    net = DinoV3() if name == "dinov3l" else torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
+    net = DinoV3((12, 18) if name == "dinov3l_ml" else ()) if name.startswith("dinov3l") else torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
     net.eval().to(dev)
     for p in net.parameters():
         p.requires_grad_(False)
@@ -127,10 +133,10 @@ def encoder(dev: torch.device, name: str = "dinov2b") -> nn.Module:
 
 
 @torch.inference_mode()
-def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32, size: int = IMAGE) -> np.ndarray:
+def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32, size: int = IMAGE, flip: bool = False) -> np.ndarray:
     chunks = []
     for i in range(0, len(paths), batch):
-        x = torch.stack([image_tensor(p, size) for p in paths[i : i + batch]]).to(dev)
+        x = torch.stack([image_tensor(p, size, flip) for p in paths[i : i + batch]]).to(dev)
         chunks.append(image_tokens(net, x).half().cpu())
         print(f"embed {min(i + batch, len(paths))}/{len(paths)}", flush=True)
     return torch.cat(chunks).numpy()
@@ -190,6 +196,16 @@ class Atlas(nn.Module):
 class Block(nn.Module):
     """Pre-norm cross-attention from points to image tokens, then an MLP, each with a residual."""
 
+    attn_drop = 0.0  # training only, set by train(); neither changes the checkpoint format
+    drop_path = 0.0
+
+    def path(self, r: torch.Tensor) -> torch.Tensor:
+        """DropPath: while training, skip this residual for a random share of the objects."""
+        if not self.training or not self.drop_path:
+            return r
+        keep = (torch.rand((r.shape[0], 1, 1), device=r.device) >= self.drop_path).to(r.dtype)
+        return r * keep / (1 - self.drop_path)
+
     def __init__(self, width: int, heads: int) -> None:
         super().__init__()
         self.heads = heads
@@ -205,12 +221,12 @@ class Block(nn.Module):
         h = self.heads
         q = self.q(self.norm_q(x)).reshape(b, n, h, w // h).transpose(1, 2)
         k, v = self.kv(tok).reshape(b, tok.shape[1], 2, h, w // h).permute(2, 0, 3, 1, 4)
-        a = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        a = torch.nn.functional.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop if self.training else 0.0)
         return self.proj(a.transpose(1, 2).reshape(b, n, w))
 
     def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
-        x = x + self.attend(x, tok)
-        return x + self.mlp(self.norm_mlp(x))
+        x = x + self.path(self.attend(x, tok))
+        return x + self.path(self.mlp(self.norm_mlp(x)))
 
 
 class SheetBlock(Block):
@@ -230,12 +246,12 @@ class SheetBlock(Block):
     def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
         b, n, w = x.shape
         s, g = self.sheets, self.side
-        x = x + self.attend(x, tok)
+        x = x + self.path(self.attend(x, tok))
         sheet = x.reshape(b, s, g * g, w).mean(2, keepdim=True)
         x = x + (self.gate.to(x.dtype) * (sheet - sheet.mean(1, keepdim=True))).expand(-1, -1, g * g, -1).reshape(b, n, w)
-        x = x + self.mlp(self.norm_mlp(x))
+        x = x + self.path(self.mlp(self.norm_mlp(x)))
         near = self.conv(x.reshape(b * s, g, g, w).permute(0, 3, 1, 2))
-        return x + near.permute(0, 2, 3, 1).reshape(b, n, w)
+        return x + self.path(near.permute(0, 2, 3, 1).reshape(b, n, w))
 
 
 class DeepAtlas(Atlas):
@@ -258,23 +274,97 @@ class DeepAtlas(Atlas):
         self.tok = nn.Linear(dim, width)
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(depth))
         self.out = nn.Sequential(nn.LayerNorm(width), nn.Linear(width, 3))
+        self.feedback = None  # CoordAtlas: each block also sees where the previous blocks put the points
+        self.hint_in = None  # add_hint(): a per-object size hint added to every query
+        self.pos_tok = None  # add_pos(): where each image token sits in the image
+        self.scale_mlp = None  # add_scale(): the object's size comes from its own head
 
-    def forward(self, tok: torch.Tensor, cat: torch.Tensor, keep: torch.Tensor | None = None) -> torch.Tensor:
+    def add_hint(self, size: int = 3) -> None:
+        self.hint_in = nn.Linear(size, self.q.out_features)
+        nn.init.zeros_(self.hint_in.weight)
+        nn.init.zeros_(self.hint_in.bias)
+
+    def add_pos(self, tokens: int = 257) -> None:
+        """A learned embedding per image token (class token + 16 x 16 patches), added after projection.
+
+        Cross-attention treats the tokens as an unordered set, so without it the decoder
+        knows where a patch lies only if the frozen features happen to encode it.
+        Zero start: the model begins exactly as the version without it.
+        """
+        self.pos_tok = nn.Parameter(torch.zeros(tokens, self.q.out_features))
+
+    def add_scale(self, dim: int, cat_logr: torch.Tensor, unit_mm: float) -> None:
+        """Split size from shape: the points are rescaled to a size predicted by a separate head.
+
+        The head reads the class token, the mean patch token and the category, and predicts
+        log RMS radius (mm) as an offset from the category's mean, with a spread sigma.
+        Squared Chamfer is lowest at the mean size, so the output uses exp(mu + sigma^2 / 2),
+        not the median exp(mu). The last layer starts at zero: the first guess is the
+        category mean.
+        """
+        width = self.q.out_features
+        self.scale_mlp = nn.Sequential(nn.LayerNorm(2 * dim + self.cat.embedding_dim), nn.Linear(2 * dim + self.cat.embedding_dim, width), nn.GELU(), nn.Linear(width, 2))
+        nn.init.zeros_(self.scale_mlp[-1].weight)
+        nn.init.zeros_(self.scale_mlp[-1].bias)
+        with torch.no_grad():
+            self.scale_mlp[-1].bias[1] = math.log(0.3)  # start with a 30% spread, not 100%
+        self.register_buffer("cat_logr", cat_logr.float().clone())
+        self.unit_mm = float(unit_mm)
+
+    scale_out: tuple[torch.Tensor, torch.Tensor] | None = None  # (mu, log sigma) of log radius in mm, for the size loss
+
+    def rescale(self, y: torch.Tensor, tok: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
+        c = y.mean(1, keepdim=True)
+        u = y - c
+        rms = u.square().sum(-1).mean(1).sqrt().clamp_min(1e-6)[:, None, None]
+        feat = torch.cat([tok[:, 0].float(), tok[:, 1:].float().mean(1), self.cat(cat).float()], -1)
+        mu, log_sig = self.scale_mlp(feat).unbind(-1)
+        mu = mu + self.cat_logr[cat]
+        log_sig = log_sig.clamp(-4.0, 1.0)
+        self.scale_out = (mu, log_sig)
+        size = torch.exp(mu + 0.5 * torch.exp(2 * log_sig)) / self.unit_mm
+        return c + u / rms * size[:, None, None]
+
+    grid_jitter = 0.0  # training only, in grid steps: set by train()
+    deep_sup = 0.0  # training only: when set, forward() leaves the earlier blocks' outputs in aux_out
+    aux_out: list[torch.Tensor] = []
+
+    def forward(self, tok: torch.Tensor, cat: torch.Tensor, keep: torch.Tensor | None = None, hint: torch.Tensor | None = None) -> torch.Tensor:
         b, p, g = tok.shape[0], self.patch.shape[0], self.grid.shape[0]
+        grid = self.grid[None, None].expand(b, p, g, -1)
+        if self.training and self.grid_jitter:
+            step = 2.0 / (int(g**0.5) - 1)
+            grid = grid + (torch.rand_like(grid) - 0.5) * 2.0 * self.grid_jitter * step
         parts = [
             self.cat(cat)[:, None, None, :].expand(b, p, g, -1),
             self.patch[None, :, None, :].expand(b, p, g, -1),
-            self.grid[None, None].expand(b, p, g, -1),
+            grid,
         ]
         x = torch.cat(parts, -1).reshape(b, p * g, -1)
         if keep is not None:
             x = x[:, keep]
-        with torch.autocast(tok.device.type, dtype=torch.bfloat16, enabled=tok.is_cuda):
+        with torch.autocast(tok.device.type, dtype=torch.bfloat16, enabled=tok.is_cuda and torch.cuda.get_device_capability(tok.device)[0] >= 8):
             x = self.q(x)
+            if hint is not None:
+                x = x + self.hint_in(hint)[:, None, :]
             t = self.tok(self.norm_tok(tok))
-            for block in self.blocks:
+            if self.pos_tok is not None:
+                t = t + self.pos_tok[: t.shape[1]]
+            aux = []
+            for i, block in enumerate(self.blocks):
+                if self.feedback is not None and i:
+                    with torch.autocast(tok.device.type, enabled=False):
+                        pos = self.out(x.float()).detach()
+                    x = x + self.feedback[i - 1](pos)
                 x = block(x, t)
-        return self.out(x.float())  # fp32 head: millimetre targets need the precision
+                if self.training and self.deep_sup and i < len(self.blocks) - 1:  # same head as the final output
+                    with torch.autocast(tok.device.type, enabled=False):
+                        aux.append(self.out(x.float()))
+            self.aux_out = aux
+        y = self.out(x.float())  # fp32 head: millimetre targets need the precision
+        if self.scale_mlp is not None:
+            y = self.rescale(y, tok, cat)
+        return y
 
 
 class SheetAtlas(DeepAtlas):
@@ -286,7 +376,144 @@ class SheetAtlas(DeepAtlas):
         self.blocks = nn.ModuleList(SheetBlock(self.q.out_features, heads, patches, side) for _ in range(depth))
 
 
-ARCHS = {"atlas": Atlas, "deep": DeepAtlas, "sheet": SheetAtlas}
+class TalkBlock(SheetBlock):
+    """SheetBlock whose 8 sheet summaries also attend to each other, so sheets can divide the surface.
+
+    The conversation runs at 64 dimensions and its output starts at zero, so the block begins as a SheetBlock.
+    """
+
+    def __init__(self, width: int, heads: int, sheets: int, side: int, talk: int = 64) -> None:
+        super().__init__(width, heads, sheets, side)
+        self.talk_norm = nn.LayerNorm(width)
+        self.talk_in = nn.Linear(width, talk)
+        self.talk = nn.MultiheadAttention(talk, 4, batch_first=True)
+        self.talk_out = nn.Linear(talk, width)
+        nn.init.zeros_(self.talk_out.weight)
+        nn.init.zeros_(self.talk_out.bias)
+
+    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        b, n, w = x.shape
+        s, g = self.sheets, self.side
+        x = x + self.path(self.attend(x, tok))
+        sheet = x.reshape(b, s, g * g, w).mean(2, keepdim=True)
+        x = x + (self.gate.to(x.dtype) * (sheet - sheet.mean(1, keepdim=True))).expand(-1, -1, g * g, -1).reshape(b, n, w)
+        summary = self.talk_in(self.talk_norm(x.reshape(b, s, g * g, w).mean(2)))
+        said, _ = self.talk(summary, summary, summary, need_weights=False)
+        x = x + self.path(self.talk_out(said)[:, :, None].expand(-1, -1, g * g, -1).reshape(b, n, w))
+        x = x + self.path(self.mlp(self.norm_mlp(x)))
+        near = self.conv(x.reshape(b * s, g, g, w).permute(0, 3, 1, 2))
+        return x + self.path(near.permute(0, 2, 3, 1).reshape(b, n, w))
+
+
+class TalkAtlas(SheetAtlas):
+    """SheetAtlas with TalkBlocks: sheet-level attention between the 8 sheets in every block."""
+
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8, fourier: int = 0) -> None:
+        super().__init__(dim, n_cat, n, patches, depth, heads, fourier)
+        side = int((n // patches) ** 0.5)
+        self.blocks = nn.ModuleList(TalkBlock(self.q.out_features, heads, patches, side) for _ in range(depth))
+
+
+class CoordAtlas(TalkAtlas):
+    """TalkAtlas where every block after the first is told the 3D positions the decoder has reached so far."""
+
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8, fourier: int = 0) -> None:
+        super().__init__(dim, n_cat, n, patches, depth, heads, fourier)
+        self.feedback = nn.ModuleList(nn.Linear(3, self.q.out_features) for _ in range(depth - 1))
+        for layer in self.feedback:
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+
+class PatchTalkBlock(SheetBlock):
+    """SheetBlock whose sheets talk through 4x4 regions each, 128 tokens in all, not one summary per sheet."""
+
+    def __init__(self, width: int, heads: int, sheets: int, side: int, talk: int = 64, cells: int = 4) -> None:
+        super().__init__(width, heads, sheets, side)
+        self.cells = cells
+        self.talk_norm = nn.LayerNorm(width)
+        self.talk_in = nn.Linear(width, talk)
+        self.talk = nn.MultiheadAttention(talk, 4, batch_first=True)
+        self.talk_out = nn.Linear(talk, width)
+        nn.init.zeros_(self.talk_out.weight)
+        nn.init.zeros_(self.talk_out.bias)
+
+    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        b, n, w = x.shape
+        s, g, c = self.sheets, self.side, self.cells
+        x = x + self.path(self.attend(x, tok))
+        sheet = x.reshape(b, s, g * g, w).mean(2, keepdim=True)
+        x = x + (self.gate.to(x.dtype) * (sheet - sheet.mean(1, keepdim=True))).expand(-1, -1, g * g, -1).reshape(b, n, w)
+        y = self.talk_in(self.talk_norm(x)).reshape(b * s, g, g, -1).permute(0, 3, 1, 2)
+        cell = torch.nn.functional.avg_pool2d(y, g // c).flatten(2).transpose(1, 2).reshape(b, s * c * c, -1)
+        said, _ = self.talk(cell, cell, cell, need_weights=False)
+        said = said.reshape(b * s, c, c, -1).permute(0, 3, 1, 2)
+        said = torch.nn.functional.interpolate(said.float(), size=(g, g), mode="bilinear", align_corners=False).to(y.dtype)
+        x = x + self.path(self.talk_out(said.permute(0, 2, 3, 1).reshape(b, n, -1)))
+        x = x + self.path(self.mlp(self.norm_mlp(x)))
+        near = self.conv(x.reshape(b * s, g, g, w).permute(0, 3, 1, 2))
+        return x + self.path(near.permute(0, 2, 3, 1).reshape(b, n, w))
+
+
+class PatchTalkAtlas(SheetAtlas):
+    """SheetAtlas with PatchTalkBlocks."""
+
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8, fourier: int = 0) -> None:
+        super().__init__(dim, n_cat, n, patches, depth, heads, fourier)
+        side = int((n // patches) ** 0.5)
+        self.blocks = nn.ModuleList(PatchTalkBlock(self.q.out_features, heads, patches, side) for _ in range(depth))
+
+
+class SphereBlock(Block):
+    """Block for one closed 64 x 128 latitude-longitude grid: region attention, MLP, seam-free 3x3 filter."""
+
+    def __init__(self, width: int, heads: int, rows: int = 64, cols: int = 128, talk: int = 64, cell: int = 16) -> None:
+        super().__init__(width, heads)
+        self.rows, self.cols, self.cell = rows, cols, cell
+        self.talk_norm = nn.LayerNorm(width)
+        self.talk_in = nn.Linear(width, talk)
+        self.talk = nn.MultiheadAttention(talk, 4, batch_first=True)
+        self.talk_out = nn.Linear(talk, width)
+        self.conv = nn.Conv2d(width, width, 3, groups=width)
+        for layer in (self.talk_out, self.conv):
+            nn.init.zeros_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, x: torch.Tensor, tok: torch.Tensor) -> torch.Tensor:
+        b, n, w = x.shape
+        r, c, k = self.rows, self.cols, self.cell
+        x = x + self.path(self.attend(x, tok))
+        y = self.talk_in(self.talk_norm(x)).reshape(b, r, c, -1).permute(0, 3, 1, 2)
+        cell = torch.nn.functional.avg_pool2d(y, k)
+        cr, cc = cell.shape[2:]
+        cell = cell.flatten(2).transpose(1, 2)
+        said, _ = self.talk(cell, cell, cell, need_weights=False)
+        said = said.transpose(1, 2).reshape(b, -1, cr, cc)
+        said = torch.nn.functional.interpolate(said.float(), size=(r, c), mode="bilinear", align_corners=False).to(y.dtype)
+        x = x + self.path(self.talk_out(said.permute(0, 2, 3, 1).reshape(b, n, -1)))
+        x = x + self.path(self.mlp(self.norm_mlp(x)))
+        z = x.reshape(b, r, c, w).permute(0, 3, 1, 2)
+        z = torch.nn.functional.pad(torch.nn.functional.pad(z, (1, 1, 0, 0), mode="circular"), (0, 0, 1, 1), mode="replicate")
+        return x + self.path(self.conv(z).permute(0, 2, 3, 1).reshape(b, n, w))
+
+
+class SphereAtlas(DeepAtlas):
+    """One closed grid on a unit sphere in place of 8 flat sheets: queries are 3D sphere positions."""
+
+    def __init__(self, dim: int, n_cat: int, n: int = N, patches: int = PATCHES, depth: int = 4, heads: int = 8, fourier: int = 0) -> None:
+        super().__init__(dim, n_cat, n, patches, depth, heads, fourier)
+        rows, cols = 64, 128
+        theta = (torch.arange(rows) + 0.5) / rows * torch.pi
+        phi = (torch.arange(cols) + 0.5) / cols * 2.0 * torch.pi
+        tt, pp = torch.meshgrid(theta, phi, indexing="ij")
+        self.register_buffer("grid", torch.stack([tt.sin() * pp.cos(), tt.sin() * pp.sin(), tt.cos()], -1).reshape(-1, 3))
+        self.patch = nn.Parameter(torch.randn(1, 16) * 0.02)
+        width = self.q.out_features
+        self.q = nn.Linear(32 + 16 + 3, width)
+        self.blocks = nn.ModuleList(SphereBlock(width, heads, rows, cols) for _ in range(depth))
+
+
+ARCHS = {"atlas": Atlas, "deep": DeepAtlas, "sheet": SheetAtlas, "talk": TalkAtlas, "coord": CoordAtlas, "patch": PatchTalkAtlas, "sphere": SphereAtlas}
 
 
 def cd_l2(pred: torch.Tensor, gt: torch.Tensor, k: int = 2048) -> torch.Tensor:
@@ -311,7 +538,7 @@ def nearest(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> tuple[torch.
     return torch.cat(d), torch.cat(j)
 
 
-def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024, weight: torch.Tensor | None = None) -> torch.Tensor:
+def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024, weight: torch.Tensor | None = None, sides: tuple[float, float] = (1.0, 1.0)) -> torch.Tensor:
     """Training loss: exact CD-L2 over every point, at the best PCA sign flip of each target.
 
     PCA fixes the axes but not their signs: geom.canonicalize picks them by skewness, and
@@ -346,8 +573,63 @@ def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int
             j2 = torch.where(better, k + s, j2)
     to_gt = (pred - torch.gather(gf, 1, j1[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
     to_pred = (gf - torch.gather(pred, 1, j2[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
-    cd = to_gt + to_pred
+    cd = sides[0] * to_gt + sides[1] * to_pred
     return (cd if weight is None else cd * weight).mean()
+
+
+def sliced_w2(pred: torch.Tensor, gt: torch.Tensor, dirs: int = 64) -> torch.Tensor:
+    """Sliced Wasserstein-2: both clouds projected on random directions, sorted, matched one to one.
+
+    Chamfer lets many predicted points sit on one target point and leave others unmatched;
+    an equal-count match cannot, so it pushes the cloud out to cover the whole surface
+    (our predictions crowd inward: RMS radius 0.77x the truth). pred (b, n, 3), gt (b, m, 3).
+    """
+    n = min(pred.shape[1], gt.shape[1])
+    if gt.shape[1] != n:
+        gt = gt[:, torch.randperm(gt.shape[1], device=gt.device)[:n]]
+    if pred.shape[1] != n:
+        pred = pred[:, torch.randperm(pred.shape[1], device=pred.device)[:n]]
+    d = torch.randn(3, dirs, device=pred.device)
+    d = d / d.norm(dim=0, keepdim=True)
+    a = torch.sort(pred.float() @ d, dim=1).values
+    b = torch.sort(gt.float() @ d, dim=1).values
+    return (a - b).square().mean((1, 2)).mean()
+
+
+def repulsion(pred: torch.Tensor, k: int = 4, pick: int = 1024) -> torch.Tensor:
+    """Penalise points closer to their neighbours than an even cover of the object would put them.
+
+    8192 points spread evenly over a sphere of radius r sit about 0.04 r apart. Most predicted
+    points are nobody's nearest, so clumps waste points that could cover the surface.
+    Neighbours come from a random subset of `pick` points to keep this cheap.
+    """
+    b, n = pred.shape[:2]
+    q = pred[:, torch.randperm(n, device=pred.device)[:pick]]
+    with torch.no_grad():
+        j = torch.cdist(q.detach(), pred.detach()).topk(k + 1, largest=False).indices[..., 1:]
+        r = (pred.detach() - pred.detach().mean(1, keepdim=True)).square().sum(-1).mean(1).sqrt()
+    near = torch.gather(pred, 1, j.reshape(b, -1, 1).expand(-1, -1, 3)).reshape(b, pick, k, 3)
+    d2 = (q[:, :, None] - near).square().sum(-1)
+    return ((0.04 * r)[:, None, None].square() - d2).clamp(min=0).mean()
+
+
+def size_hints(query: torch.Tensor, qcat: torch.Tensor, bank: torch.Tensor, bcat: torch.Tensor, blogr: torch.Tensor, self_idx: torch.Tensor | None = None, k: int = 2) -> torch.Tensor:
+    """Size of the k most similar bank objects: normalised mean log radius, nearest log radius, mean similarity.
+
+    Similarity is cosine between class tokens, inside the query's category when it has at least k other
+    members, else over the whole bank. self_idx leaves each query's own row out, so training objects
+    cannot read their own size.
+    """
+    sim = torch.nn.functional.normalize(query, dim=-1) @ torch.nn.functional.normalize(bank, dim=-1).T
+    same = qcat[:, None] == bcat[None, :]
+    if self_idx is not None:
+        here = torch.arange(len(query), device=query.device)
+        sim[here, self_idx] = -float("inf")
+        same[here, self_idx] = False
+    pick = torch.where(same.sum(1, keepdim=True) >= k, torch.where(same, sim, torch.full_like(sim, -float("inf"))), sim)
+    top = pick.topk(k, 1)
+    r = (blogr[top.indices] - np.log(30.0)) / 0.5
+    return torch.stack([r.mean(1), r[:, 0], top.values.mean(1)], 1)
 
 
 def _mesh_row(img: str) -> tuple[str, str, np.ndarray]:
@@ -429,6 +711,69 @@ def cache(enc: str = "dinov2b") -> None:
     print(f"cached {len(ids)}  dim {feats.shape[1]}  -> {OUT / 'train.npz'}")
 
 
+def augment_image(path: Path, size: int, rng: np.random.Generator) -> torch.Tensor:
+    """A label-preserving view of one training image.
+
+    In-plane rotation (+-20 deg), zoom (0.9-1.1) and colour jitter (+-20%). The target is a
+    PCA-canonical cloud, which does not depend on how the object sits in the picture, so it
+    stays the same. The camera auto-frames every object, so zoom does not change its size.
+    """
+    from PIL import ImageEnhance
+
+    im = Image.open(path).convert("RGB")
+    w, h = im.size
+    bg = tuple(int(v) for v in np.median(np.asarray(im)[:8].reshape(-1, 3), 0))  # backdrop colour along the top edge
+    im = im.rotate(float(rng.uniform(-20, 20)), resample=Image.BICUBIC, fillcolor=bg)
+    z = float(rng.uniform(0.9, 1.1))
+    cw, ch = int(w / z), int(h / z)
+    canvas = Image.new("RGB", (cw, ch), bg)
+    canvas.paste(im, ((cw - w) // 2, (ch - h) // 2))
+    im = canvas.resize((size, size), Image.BICUBIC)
+    for enh in (ImageEnhance.Brightness, ImageEnhance.Contrast, ImageEnhance.Color):
+        im = enh(im).enhance(float(rng.uniform(0.8, 1.2)))
+    x = torch.from_numpy(np.asarray(im)).permute(2, 0, 1).float() / 255.0
+    return (x - torch.tensor(MEAN)[:, None, None]) / torch.tensor(STD)[:, None, None]
+
+
+def aug_cache_path(enc: str, k: int) -> Path:
+    return OUT / f"train_{enc}_aug{k}.npz"
+
+
+def augcache(enc: str, sets: int, seed: int = 0) -> None:
+    """Token sets for augmented views of every training image, one file per set; finished sets are skipped."""
+    paths = rows("train")
+    ids = np.load(OUT / "train.npz", allow_pickle=False)["ids"]
+    if ids.tolist() != [p.parent.name for p in paths]:
+        raise SystemExit("train.npz does not match the training images")
+    dev = device()
+    net = encoder(dev, enc)
+    for k in range(sets):
+        if aug_cache_path(enc, k).exists():
+            continue
+        rng = np.random.default_rng(seed * 1000 + k)
+        chunks = []
+        with torch.inference_mode():
+            for i in range(0, len(paths), 32):
+                x = torch.stack([augment_image(p, ENCODERS[enc], rng) for p in paths[i : i + 32]]).to(dev)
+                chunks.append(image_tokens(net, x).half().cpu())
+                print(f"aug set {k}: {min(i + 32, len(paths))}/{len(paths)}", flush=True)
+        np.savez(aug_cache_path(enc, k), ids=ids, feats=torch.cat(chunks).numpy())
+        print(f"saved {aug_cache_path(enc, k)}", flush=True)
+
+
+def flip_cache_path(enc: str) -> Path:
+    return OUT / f"train_{enc}_flip.npz"
+
+
+def cache_flip(enc: str) -> None:
+    """Tokens of every horizontally flipped training image."""
+    paths = rows("train")
+    dev = device()
+    feats = embed(encoder(dev, enc), paths, dev, size=ENCODERS[enc], flip=True)
+    np.savez(flip_cache_path(enc), ids=np.array([p.parent.name for p in paths]), feats=feats)
+    print(f"cached flipped tokens {feats.shape} -> {flip_cache_path(enc)}")
+
+
 def _load_cache(enc: str = "dinov2b") -> tuple[dict, dict[str, int]]:
     """Clouds, categories and ids from train.npz; image tokens from the encoder's cache."""
     for path in {OUT / "train.npz", cache_path(enc)}:
@@ -457,7 +802,25 @@ def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
 
-def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False) -> None:
+def right_handed(pts: np.ndarray, ids: list[str]) -> np.ndarray:
+    """Undo the mirror that canonicalize's skewness signs give about half the objects.
+
+    train_mirror.npz marks objects whose canonical frame has det -1 (from the meshes).
+    Flipping their least certain axis (smallest |skewness|) makes every target a pure
+    rotation of the real object, so the decoder no longer has to learn both handednesses.
+    """
+    with np.load(OUT / "train_mirror.npz") as m:
+        mark = dict(zip(m["ids"].tolist(), m["mirror"].tolist()))
+    out = pts.copy()
+    for k, i in enumerate(ids):
+        if mark[i]:
+            c = out[k] - out[k].mean(0)
+            axis = int(np.argmin(np.abs((c**3).mean(0))))
+            out[k, :, axis] *= -1
+    return out
+
+
+def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False, drop_path: float = 0.0, attn_drop: float = 0.0, grid_jitter: float = 0.0, repulse: float = 0.0, ema: float = 0.0, deep_sup: float = 0.0, flip_aug: bool = False, size_hint: bool = False, cat_drop: float = 0.0, sides: tuple[float, float] = (1.0, 1.0), pos: bool = False, right: bool = False, aug_sets: int = 0, size_head: float = 0.0, swd: float = 0.0) -> None:
     """target unit: shape only, size from scale.py. target mm: shape and size end to end.
 
     On the 10% holdout the end-to-end model beat every unit shape x predicted size
@@ -465,11 +828,19 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
     the sizes it is unsure of, which squared Chamfer rewards.
     """
     z, vocab = _load_cache(enc)
+    if cat_drop:
+        vocab["<unk>"] = len(vocab)
     dev = device()
     feats = torch.tensor(z["feats"], dtype=torch.float32)
+    flipped = None
+    if flip_aug:
+        with np.load(flip_cache_path(enc), allow_pickle=False) as fz:
+            if fz["ids"].tolist() != z["ids"].tolist():
+                raise SystemExit("flipped tokens are stale. Run: uv run baselines/atlas.py flipcache")
+            flipped = torch.tensor(fz["feats"], dtype=torch.float32)
     if feats.ndim != 3:
         raise SystemExit("cache has no patch tokens. Run: python baselines/atlas.py cache")
-    pts = torch.tensor(z["pts"], dtype=torch.float32)
+    pts = torch.tensor(right_handed(z["pts"], z["ids"].tolist()) if right else z["pts"], dtype=torch.float32)
     r = radii(pts)
     # the deep decoder's normalised head cannot reach millimetres quickly: it predicts
     # in units of 40 mm (about the median radius). Still end to end, one global constant.
@@ -501,57 +872,148 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             if d["ids"].tolist() != z["ids"].tolist():
                 raise SystemExit(f"{DENSE_CACHE} is stale. Run: uv run baselines/atlas.py dense")
             dense = torch.from_numpy(d["pts"]) / unit_mm
-    net = ARCHS[arch](feats.shape[-1], len(vocab), fourier=fourier).to(dev)
+    net = ARCHS[arch](feats.shape[-1], len(vocab), fourier=fourier)
+    hints, hint_bank = None, None
+    if size_hint:
+        if arch == "atlas":
+            raise SystemExit("--size-hint needs a block decoder")
+        net.add_hint()
+        tr_t = torch.from_numpy(np.sort(tr))
+        logr = r.log()
+        hint_bank = {"cls": feats[tr_t, 0].clone(), "cat": cat[tr_t].clone(), "logr": logr[tr_t].clone()}
+        hints = torch.zeros(len(feats), 3)
+        hints[tr_t] = size_hints(hint_bank["cls"], hint_bank["cat"], hint_bank["cls"], hint_bank["cat"], hint_bank["logr"], self_idx=torch.arange(len(tr_t)))
+        val_t = torch.from_numpy(val)
+        hints[val_t] = size_hints(feats[val_t, 0], cat[val_t], hint_bank["cls"], hint_bank["cat"], hint_bank["logr"])
+    cat_logr = None
+    if size_head:
+        if arch == "atlas" or target != "mm":
+            raise SystemExit("--size-head needs a block decoder and --target mm")
+        logr = torch.log(r)
+        cat_logr = torch.full((len(vocab),), float(logr[tr].mean()))
+        for c_i in torch.unique(cat[tr]).tolist():  # category means from the training split only
+            cat_logr[c_i] = logr[tr][cat[tr] == c_i].mean()
+        net.add_scale(feats.shape[-1], cat_logr, unit_mm)
+    if pos:
+        if arch == "atlas" or token_drop:
+            raise SystemExit("--pos-emb needs a block decoder and all tokens")
+        net.add_pos(feats.shape[1])
+    net = net.to(dev)
     print(f"{arch}: {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M parameters")
+    if deep_sup:
+        if arch == "atlas":
+            raise SystemExit("--deep-sup needs a block decoder")
+        net.deep_sup = deep_sup
+    if drop_path or attn_drop or grid_jitter:
+        if arch == "atlas" or (grid_jitter and fourier):
+            raise SystemExit("--drop-path, --attn-drop and --grid-jitter need the deep or sheet decoder; --grid-jitter also needs raw uv")
+        net.grid_jitter = grid_jitter
+        for i, blk in enumerate(net.blocks):  # stochastic depth rises from 0 at the first block
+            blk.attn_drop, blk.drop_path = attn_drop, drop_path * i / (len(net.blocks) - 1)
     lr = 1e-3 if arch == "atlas" else 3e-4
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
     steps = epochs * -(-len(tr) // (4 if dev.type == "cuda" else 2))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=steps, pct_start=0.05) if arch != "atlas" else None
     batch = 4 if dev.type == "cuda" else 2
     best, best_score = None, float("inf")
-    for epoch in range(1, epochs + 1):
-        net.train()
-        rng.shuffle(tr)
-        total = 0.0
-        seen = 0
-        for i in range(0, len(tr), batch):
-            b = tr[i : i + batch]
-            tok = feats[b]
-            if token_drop:  # the class token stays; a random share of the patch tokens does not
-                kept = torch.randperm(tok.shape[1] - 1)[: int((tok.shape[1] - 1) * (1 - token_drop))] + 1
-                tok = tok[:, torch.cat([torch.zeros(1, dtype=torch.long), kept])]
-            if arch == "deep" and not all_queries:
-                pred = net(tok.to(dev), cat[b].to(dev), keep=torch.randperm(N, device=dev)[: N // 2])
-            else:
-                pred = net(tok.to(dev), cat[b].to(dev))
-            gt = (unit[b] if dense is None else dense[b][:, torch.randperm(DENSE)[:N]]).to(dev)
-            loss = chamfer(pred, gt, flips=flips, weight=None if weight is None else weight[b].to(dev))
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            if sched is not None:
-                sched.step()
-            total += float(loss.detach()) * len(b)
-            seen += len(b)
-        net.eval()
+    shadow, ema_best, ema_score, ema_step = None, None, float("inf"), 0
+    if ema:  # a second decoder holds the running average of the weights; checked alongside the first
+        shadow = ARCHS[arch](feats.shape[-1], len(vocab), fourier=fourier)
+        if size_hint:
+            shadow.add_hint()
+        if pos:
+            shadow.add_pos(feats.shape[1])
+        if size_head:
+            shadow.add_scale(feats.shape[-1], cat_logr, unit_mm)
+        shadow = shadow.to(dev).eval()
+        shadow.load_state_dict(net.state_dict())
+
+    def check(model: nn.Module) -> float:
         vtotal, vseen = 0.0, 0
         with torch.inference_mode():
             for i in range(0, len(val), batch):
                 b = val[i : i + batch]
-                pred = net(feats[b].to(dev), cat[b].to(dev))
+                pred = model(feats[b].to(dev), cat[b].to(dev), **({"hint": hints[b].to(dev)} if hints is not None else {}))
                 # shape error in mm^2 at the true size: CD scales with r^2
                 for j, k in enumerate(b):
                     gain = float(r[k]) ** 2 if target == "unit" else unit_mm**2
                     vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev), flips=flips)) * gain
                 vseen += len(b)
-        score = vtotal / vseen
+        return vtotal / vseen
+
+    for epoch in range(1, epochs + 1):
+        net.train()
+        rng.shuffle(tr)
+        src = feats  # the holdout check always reads the plain tokens
+        if aug_sets and (k := (epoch - 1) % (aug_sets + 1)):  # epochs cycle: plain, view 0, view 1, ...
+            with np.load(aug_cache_path(enc, k - 1), allow_pickle=False) as az:
+                src = torch.tensor(az["feats"], dtype=torch.float32)
+        total = 0.0
+        seen = 0
+        for i in range(0, len(tr), batch):
+            b = tr[i : i + batch]
+            tok = src[b]
+            if flipped is not None:  # the mirrored image has the same canonical target (geom.canonicalize fixes signs by skewness)
+                pick_flip = torch.from_numpy(rng.random(len(b)) < 0.5)
+                tok = torch.where(pick_flip[:, None, None], flipped[b], tok)
+            if token_drop:  # the class token stays; a random share of the patch tokens does not
+                kept = torch.randperm(tok.shape[1] - 1)[: int((tok.shape[1] - 1) * (1 - token_drop))] + 1
+                tok = tok[:, torch.cat([torch.zeros(1, dtype=torch.long), kept])]
+            c_b = cat[b]
+            if cat_drop:  # learn a fallback for unseen categories, and lean less on the label
+                c_b = torch.where(torch.rand(len(b)) < cat_drop, torch.full_like(c_b, vocab["<unk>"]), c_b)
+            extra = {"hint": hints[b].to(dev)} if hints is not None else {}
+            if arch == "deep" and not all_queries:
+                pred = net(tok.to(dev), c_b.to(dev), keep=torch.randperm(N, device=dev)[: N // 2], **extra)
+            else:
+                pred = net(tok.to(dev), c_b.to(dev), **extra)
+            gt = (unit[b] if dense is None else dense[b][:, torch.randperm(DENSE)[:N]]).to(dev)
+            loss = chamfer(pred, gt, flips=flips, weight=None if weight is None else weight[b].to(dev), sides=sides)
+            if repulse:
+                loss = loss + repulse * repulsion(pred)
+            if swd:  # equal-count transport term next to Chamfer, same units
+                loss = loss + swd * sliced_w2(pred, gt)
+            if size_head:  # Gaussian NLL of the true log radius under the head's (mu, sigma)
+                mu, log_sig = net.scale_out
+                z_ = (torch.log(r[b]).to(dev) - mu) / torch.exp(log_sig)
+                loss = loss + size_head * (log_sig + 0.5 * z_.square()).mean()
+            if deep_sup:  # each earlier block also has to draw the object, at a smaller weight
+                for early in net.aux_out:
+                    loss = loss + deep_sup * chamfer(early, gt, flips=flips)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            if sched is not None:
+                sched.step()
+            if shadow is not None:  # early on, the average follows the weights more closely
+                ema_step += 1
+                d = min(ema, (1 + ema_step) / (10 + ema_step))
+                with torch.no_grad():
+                    for s, v in zip(shadow.state_dict().values(), net.state_dict().values()):
+                        s.lerp_(v, 1 - d) if s.is_floating_point() else s.copy_(v)
+            total += float(loss.detach()) * len(b)
+            seen += len(b)
+        net.eval()
+        score = check(net)
         if score < best_score:
             best_score = score
             best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
-        print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else ""), flush=True)
+        note = ""
+        if shadow is not None:
+            now = check(shadow)
+            note = f"  ema {now:.1f}"
+            if now < ema_score:
+                ema_score = now
+                ema_best = {k: v.detach().cpu().clone() for k, v in shadow.state_dict().items()}
+        print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else "") + note, flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"state": best, "vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier}, ckpt)
+    blob = {"vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier, "hint_bank": hint_bank, "pos": pos, "tokens": feats.shape[1], "size_head": size_head, "n_vocab": len(vocab)}
+    torch.save({"state": best, **blob}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
+    if shadow is not None:
+        path = ckpt.with_name(f"{ckpt.stem}_ema.pt")
+        torch.save({"state": ema_best, **blob}, path)
+        print(f"saved {path}  holdout {ema_score:.1f}")
 
 
 def descriptor(tok: torch.Tensor) -> torch.Tensor:
@@ -607,11 +1069,34 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
     if not ckpt.exists():
         raise SystemExit(f"missing {ckpt}. Run: uv run baselines/atlas.py train")
     blob = torch.load(ckpt, map_location="cpu", weights_only=False)
-    net = ARCHS[blob.get("arch", "atlas")](blob["dim"], len(blob["vocab"]), fourier=blob.get("fourier", 0)).to(dev).eval()
+    net = ARCHS[blob.get("arch", "atlas")](blob["dim"], len(blob["vocab"]), fourier=blob.get("fourier", 0))
+    if blob.get("hint_bank") is not None:
+        net.add_hint()
+    if blob.get("pos"):
+        net.add_pos(blob["tokens"])
+    if blob.get("size_head"):  # the category means come back with the weights
+        net.add_scale(blob["dim"], torch.zeros(len(blob["vocab"])), blob["unit_mm"])
+    net = net.to(dev).eval()
     net.load_state_dict(blob["state"])
+    if blob.get("hint_bank") is not None:
+        net = Hinted(net, blob["hint_bank"]).to(dev).eval()
     if blob.get("unit_mm", 1.0) != 1.0:
         net = Scaled(net, blob["unit_mm"])
     return net, blob
+
+
+class Hinted(nn.Module):
+    """Look up the size hint from the training objects stored in the checkpoint, so callers need not."""
+
+    def __init__(self, net: nn.Module, bank: dict) -> None:
+        super().__init__()
+        self.net = net
+        self.register_buffer("cls", bank["cls"])
+        self.register_buffer("cat", bank["cat"])
+        self.register_buffer("logr", bank["logr"])
+
+    def forward(self, tok: torch.Tensor, cat: torch.Tensor) -> torch.Tensor:
+        return self.net(tok, cat, hint=size_hints(tok[:, 0].float(), cat, self.cls, self.cat, self.logr))
 
 
 class Scaled(nn.Module):
@@ -661,7 +1146,7 @@ def predict_ensemble(ckpts: list[Path]) -> None:
         out = []
         with torch.inference_mode():
             for i, tok in zip(range(0, len(paths), 8), tokens[name]):
-                cat = torch.tensor([vocab.get(p.parent.parent.name, 0) for p in paths[i : i + 8]], dtype=torch.long, device=dev)
+                cat = torch.tensor([vocab.get(p.parent.parent.name, vocab.get("<unk>", 0)) for p in paths[i : i + 8]], dtype=torch.long, device=dev)
                 out.append(net(tok.to(dev), cat).cpu().numpy())
         per_model.append(np.concatenate(out))
         print(f"{ckpt.name}: {len(paths)} clouds", flush=True)
@@ -691,7 +1176,7 @@ def predict(ckpt: Path, shape: str) -> None:
     if not paths:
         raise SystemExit("no eval images")
     vocab = blob["vocab"]
-    unk = 0
+    unk = vocab.get("<unk>", 0)
     clouds = {}
     with torch.inference_mode():
         for i in range(0, len(paths), 8):
@@ -835,7 +1320,7 @@ def fit_check() -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "dense", "train", "predict", "evaluate", "check"])
+    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "augcache", "dense", "flipcache", "train", "predict", "evaluate", "check"])
     ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--arch", choices=sorted(ARCHS), default="deep", help="train: decoder (atlas = the original)")
@@ -849,6 +1334,22 @@ if __name__ == "__main__":
     ap.add_argument("--all-queries", action="store_true", help="train: deep decoder on all queries instead of a random half")
     ap.add_argument("--reweight-oversized", action="store_true", help="train: keep oversized objects, capping their loss at a typical object's")
     ap.add_argument("--drop-oversized", action="store_true", help="train: leave oversized objects out of training and of the holdout check")
+    ap.add_argument("--drop-path", type=float, default=0.0, help="train: stochastic depth, rising from 0 at the first block to this at the last")
+    ap.add_argument("--attn-drop", type=float, default=0.0, help="train: dropout on the cross-attention weights")
+    ap.add_argument("--grid-jitter", type=float, default=0.0, help="train: uniform noise on the sheet coordinates, half-width in grid steps")
+    ap.add_argument("--repulsion", type=float, default=0.0, help="train: weight of the loss that pushes clumped points apart")
+    ap.add_argument("--ema", type=float, default=0.0, help="train: decay of a running average of the weights, saved as <ckpt>_ema.pt")
+    ap.add_argument("--deep-sup", type=float, default=0.0, help="train: weight of the extra Chamfer losses on the earlier decoder blocks")
+    ap.add_argument("--flip-aug", action="store_true", help="train: use horizontally flipped image tokens for a random half of each batch (run: flipcache)")
+    ap.add_argument("--size-hint", action="store_true", help="train: give every query the size of the most similar training objects")
+    ap.add_argument("--swd", type=float, default=0.0, help="train: weight of a sliced Wasserstein term next to Chamfer (try 0.5)")
+    ap.add_argument("--size-head", type=float, default=0.0, help="train: separate size head; value = weight of its log-size NLL (try 0.01)")
+    ap.add_argument("--aug-sets", type=int, default=0, help="augcache: views to cache; train: cycle through that many augmented views (augcache first)")
+    ap.add_argument("--right-handed", action="store_true", help="train: un-mirror the targets canonicalize mirrored (needs train_mirror.npz)")
+    ap.add_argument("--pos-emb", action="store_true", help="train: learned position embedding on the image tokens")
+    ap.add_argument("--cat-drop", type=float, default=0.0, help="train: share of objects whose category is replaced by an unknown token")
+    ap.add_argument("--stray-weight", type=float, default=1.0, help="train: weight of the predicted-to-true half of the loss")
+    ap.add_argument("--miss-weight", type=float, default=1.0, help="train: weight of the true-to-predicted half of the loss")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
@@ -856,8 +1357,12 @@ if __name__ == "__main__":
         cache(args.encoder)
     elif args.cmd == "dense":
         cache_dense()
+    elif args.cmd == "flipcache":
+        cache_flip(args.encoder)
+    elif args.cmd == "augcache":
+        augcache(args.encoder, args.aug_sets, args.seed)
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized, args.drop_path, args.attn_drop, args.grid_jitter, args.repulsion, args.ema, args.deep_sup, args.flip_aug, args.size_hint, args.cat_drop, (args.stray_weight, args.miss_weight), args.pos_emb, args.right_handed, args.aug_sets, args.size_head, args.swd)
     elif args.cmd == "predict":
         if len(args.ckpt) > 1:
             predict_ensemble(args.ckpt)
