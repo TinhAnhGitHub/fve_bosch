@@ -46,7 +46,7 @@ CKPT = OUT / "atlas.pt"
 SCALE = ROOT / "baselines" / "out" / "scale" / "scale.npz"
 HEDGE = ROOT / "baselines" / "out" / "scale" / "hedge.json"
 IMAGE = 224
-ENCODERS = {"dinov2b": 224, "dinov3l": 256, "dinov3l_ml": 256, "dinov3l384": 384}  # name -> input size; 257 tokens, 577 at 384 px
+ENCODERS = {"dinov2b": 224, "dinov3l": 256, "dinov3l_ml": 256, "dinov3l384": 384, "dav2s": 224}  # name -> input size; 257 tokens, 577 at 384 px
 DINOV3 = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 N = MIN_POINTS
 DENSE = 8 * MIN_POINTS
@@ -105,6 +105,11 @@ def target_points(mesh_path: Path, n: int) -> np.ndarray:
     return canonicalize(pts).astype(np.float32)
 
 
+def half_dtype(dev: torch.device) -> torch.dtype:
+    """bf16 on Ampere and newer; fp16 on older GPUs such as the T4, which have no bf16 (train() scales the loss then)."""
+    return torch.bfloat16 if dev.type != "cuda" or torch.cuda.get_device_capability(dev)[0] >= 8 else torch.float16
+
+
 class DinoV3(nn.Module):
     """Hugging Face DINOv3 returning [class token, patch tokens], registers dropped."""
 
@@ -124,7 +129,31 @@ class DinoV3(nn.Module):
         return torch.cat([out[:, :1], out[:, 1 + self.registers :]], 1)
 
 
+class DepthTok(nn.Module):
+    """Depth Anything V2 Small (Apache-2.0) at 224 px: [class, 16 x 16 patch] tokens of 384 depth-trained features,
+    plus one channel with each patch's relative depth (z-scored per image; 0 on the class token). Same 16 x 16 grid
+    as DINOv3 at 256 px, so its tokens can be appended to the DINOv3 tokens channel-wise (train --extra dav2s)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        from transformers import AutoModelForDepthEstimation
+
+        self.net = AutoModelForDepthEstimation.from_pretrained("depth-anything/Depth-Anything-V2-Small-hf")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.net(pixel_values=x, output_hidden_states=True)
+        tok = out.hidden_states[-1]  # (b, 1 + 256, 384) from the ViT-S/14 backbone
+        d = torch.nn.functional.adaptive_avg_pool2d(out.predicted_depth[:, None], 16).flatten(1)  # (b, 256)
+        d = (d - d.mean(1, keepdim=True)) / (d.std(1, keepdim=True) + 1e-6)
+        d = torch.cat([torch.zeros_like(d[:, :1]), d], 1)[..., None]
+        return torch.cat([tok, d], -1)
+
+
 def encoder(dev: torch.device, name: str = "dinov2b") -> nn.Module:
+    if name == "dav2s":
+        net = DepthTok()
+        net.eval().to(dev)
+        return net
     net = DinoV3((12, 18) if name == "dinov3l_ml" else ()) if name.startswith("dinov3l") else torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
     net.eval().to(dev)
     for p in net.parameters():
@@ -144,7 +173,7 @@ def embed(net: nn.Module, paths: list[Path], dev: torch.device, batch: int = 32,
 
 def image_tokens(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """Class token plus patch tokens. The class token alone scored 733."""
-    if isinstance(net, DinoV3):
+    if isinstance(net, (DinoV3, DepthTok)):
         return net(x).float()
     out = net.forward_features(x)
     return torch.cat([out["x_norm_clstoken"][:, None], out["x_norm_patchtokens"]], 1).float()
@@ -278,6 +307,7 @@ class DeepAtlas(Atlas):
         self.hint_in = None  # add_hint(): a per-object size hint added to every query
         self.pos_tok = None  # add_pos(): where each image token sits in the image
         self.scale_mlp = None  # add_scale(): the object's size comes from its own head
+        self.img_query = None  # use_image_query(): the queries carry the image's global features, not the category
 
     def add_hint(self, size: int = 3) -> None:
         self.hint_in = nn.Linear(size, self.q.out_features)
@@ -292,6 +322,11 @@ class DeepAtlas(Atlas):
         Zero start: the model begins exactly as the version without it.
         """
         self.pos_tok = nn.Parameter(torch.zeros(tokens, self.q.out_features))
+
+    def use_image_query(self, dim: int) -> None:
+        """Replace the category embedding in every query by a projection of the image's class token and mean patch
+        token, so the model needs no category label (train --no-cat)."""
+        self.img_query = nn.Sequential(nn.LayerNorm(2 * dim), nn.Linear(2 * dim, self.cat.embedding_dim))
 
     def add_scale(self, dim: int, cat_logr: torch.Tensor, unit_mm: float) -> None:
         """Split size from shape: the points are rescaled to a size predicted by a separate head.
@@ -335,15 +370,16 @@ class DeepAtlas(Atlas):
         if self.training and self.grid_jitter:
             step = 2.0 / (int(g**0.5) - 1)
             grid = grid + (torch.rand_like(grid) - 0.5) * 2.0 * self.grid_jitter * step
+        cond = self.cat(cat) if self.img_query is None else self.img_query(torch.cat([tok[:, 0], tok[:, 1:].mean(1)], -1).float())
         parts = [
-            self.cat(cat)[:, None, None, :].expand(b, p, g, -1),
+            cond[:, None, None, :].expand(b, p, g, -1),
             self.patch[None, :, None, :].expand(b, p, g, -1),
             grid,
         ]
         x = torch.cat(parts, -1).reshape(b, p * g, -1)
         if keep is not None:
             x = x[:, keep]
-        with torch.autocast(tok.device.type, dtype=torch.bfloat16, enabled=tok.is_cuda and torch.cuda.get_device_capability(tok.device)[0] >= 8):
+        with torch.autocast(tok.device.type, dtype=half_dtype(tok.device), enabled=tok.is_cuda):
             x = self.q(x)
             if hint is not None:
                 x = x + self.hint_in(hint)[:, None, :]
@@ -538,8 +574,8 @@ def nearest(a: torch.Tensor, b: torch.Tensor, chunk: int = 4096) -> tuple[torch.
     return torch.cat(d), torch.cat(j)
 
 
-def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024, weight: torch.Tensor | None = None, sides: tuple[float, float] = (1.0, 1.0)) -> torch.Tensor:
-    """Training loss: exact CD-L2 over every point, at the best PCA sign flip of each target.
+def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int = 2048, pick: int = 1024, weight: torch.Tensor | None = None, sides: tuple[float, float] = (1.0, 1.0), l1: bool = False) -> torch.Tensor:
+    """Training loss: exact CD-L2 (l1=True: plain distances, a robust variant) over every point, at the best PCA sign flip of each target.
 
     PCA fixes the axes but not their signs: geom.canonicalize picks them by skewness, and
     a near-symmetric axis flips between similar objects. The grader undoes any rotation,
@@ -571,8 +607,11 @@ def chamfer(pred: torch.Tensor, gt: torch.Tensor, flips: bool = True, chunk: int
             better = v < d2
             d2 = torch.where(better, v, d2)
             j2 = torch.where(better, k + s, j2)
-    to_gt = (pred - torch.gather(gf, 1, j1[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
-    to_pred = (gf - torch.gather(pred, 1, j2[..., None].expand(-1, -1, 3))).square().sum(-1).mean(1)
+    to_gt = (pred - torch.gather(gf, 1, j1[..., None].expand(-1, -1, 3))).square().sum(-1)
+    to_pred = (gf - torch.gather(pred, 1, j2[..., None].expand(-1, -1, 3))).square().sum(-1)
+    if l1:  # un-squared distances: far outliers pull less, near pairs more (HyperCD-like)
+        to_gt, to_pred = (to_gt + 1e-8).sqrt(), (to_pred + 1e-8).sqrt()
+    to_gt, to_pred = to_gt.mean(1), to_pred.mean(1)
     cd = sides[0] * to_gt + sides[1] * to_pred
     return (cd if weight is None else cd * weight).mean()
 
@@ -820,7 +859,7 @@ def right_handed(pts: np.ndarray, ids: list[str]) -> np.ndarray:
     return out
 
 
-def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False, drop_path: float = 0.0, attn_drop: float = 0.0, grid_jitter: float = 0.0, repulse: float = 0.0, ema: float = 0.0, deep_sup: float = 0.0, flip_aug: bool = False, size_hint: bool = False, cat_drop: float = 0.0, sides: tuple[float, float] = (1.0, 1.0), pos: bool = False, right: bool = False, aug_sets: int = 0, size_head: float = 0.0, swd: float = 0.0) -> None:
+def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False, drop_path: float = 0.0, attn_drop: float = 0.0, grid_jitter: float = 0.0, repulse: float = 0.0, ema: float = 0.0, deep_sup: float = 0.0, flip_aug: bool = False, size_hint: bool = False, cat_drop: float = 0.0, sides: tuple[float, float] = (1.0, 1.0), pos: bool = False, right: bool = False, aug_sets: int = 0, size_head: float = 0.0, swd: float = 0.0, l1cd: bool = False, feat_noise: float = 0.0, no_cat: bool = False, extra_enc: str = "") -> None:
     """target unit: shape only, size from scale.py. target mm: shape and size end to end.
 
     On the 10% holdout the end-to-end model beat every unit shape x predicted size
@@ -832,6 +871,11 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         vocab["<unk>"] = len(vocab)
     dev = device()
     feats = torch.tensor(z["feats"], dtype=torch.float32)
+    if extra_enc:  # e.g. dav2s: depth tokens appended channel-wise (same 257-token grid)
+        with np.load(cache_path(extra_enc), allow_pickle=False) as ez:
+            if ez["ids"].tolist() != z["ids"].tolist():
+                raise SystemExit(f"{cache_path(extra_enc)} does not match the training ids")
+            feats = torch.cat([feats, torch.tensor(ez["feats"], dtype=torch.float32)], -1)
     flipped = None
     if flip_aug:
         with np.load(flip_cache_path(enc), allow_pickle=False) as fz:
@@ -894,6 +938,10 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         for c_i in torch.unique(cat[tr]).tolist():  # category means from the training split only
             cat_logr[c_i] = logr[tr][cat[tr] == c_i].mean()
         net.add_scale(feats.shape[-1], cat_logr, unit_mm)
+    if no_cat:
+        if arch == "atlas" or size_head:
+            raise SystemExit("--no-cat needs a block decoder and no --size-head")
+        net.use_image_query(feats.shape[-1])
     if pos:
         if arch == "atlas" or token_drop:
             raise SystemExit("--pos-emb needs a block decoder and all tokens")
@@ -912,6 +960,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             blk.attn_drop, blk.drop_path = attn_drop, drop_path * i / (len(net.blocks) - 1)
     lr = 1e-3 if arch == "atlas" else 3e-4
     opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
+    scaler = torch.amp.GradScaler(enabled=dev.type == "cuda" and half_dtype(dev) == torch.float16)  # fp16 needs loss scaling; bf16 does not
     steps = epochs * -(-len(tr) // (4 if dev.type == "cuda" else 2))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=steps, pct_start=0.05) if arch != "atlas" else None
     batch = 4 if dev.type == "cuda" else 2
@@ -923,6 +972,8 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             shadow.add_hint()
         if pos:
             shadow.add_pos(feats.shape[1])
+        if no_cat:
+            shadow.use_image_query(feats.shape[-1])
         if size_head:
             shadow.add_scale(feats.shape[-1], cat_logr, unit_mm)
         shadow = shadow.to(dev).eval()
@@ -953,6 +1004,8 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         for i in range(0, len(tr), batch):
             b = tr[i : i + batch]
             tok = src[b]
+            if feat_noise:  # Gaussian noise on the frozen tokens, scaled per token
+                tok = tok + feat_noise * tok.std(-1, keepdim=True) * torch.randn_like(tok)
             if flipped is not None:  # the mirrored image has the same canonical target (geom.canonicalize fixes signs by skewness)
                 pick_flip = torch.from_numpy(rng.random(len(b)) < 0.5)
                 tok = torch.where(pick_flip[:, None, None], flipped[b], tok)
@@ -968,7 +1021,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             else:
                 pred = net(tok.to(dev), c_b.to(dev), **extra)
             gt = (unit[b] if dense is None else dense[b][:, torch.randperm(DENSE)[:N]]).to(dev)
-            loss = chamfer(pred, gt, flips=flips, weight=None if weight is None else weight[b].to(dev), sides=sides)
+            loss = chamfer(pred, gt, flips=flips, weight=None if weight is None else weight[b].to(dev), sides=sides, l1=l1cd)
             if repulse:
                 loss = loss + repulse * repulsion(pred)
             if swd:  # equal-count transport term next to Chamfer, same units
@@ -981,8 +1034,9 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
                 for early in net.aux_out:
                     loss = loss + deep_sup * chamfer(early, gt, flips=flips)
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
             if sched is not None:
                 sched.step()
             if shadow is not None:  # early on, the average follows the weights more closely
@@ -1007,7 +1061,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
                 ema_best = {k: v.detach().cpu().clone() for k, v in shadow.state_dict().items()}
         print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else "") + note, flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    blob = {"vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier, "hint_bank": hint_bank, "pos": pos, "tokens": feats.shape[1], "size_head": size_head, "n_vocab": len(vocab)}
+    blob = {"vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier, "hint_bank": hint_bank, "pos": pos, "tokens": feats.shape[1], "size_head": size_head, "n_vocab": len(vocab), "no_cat": no_cat, "extra": extra_enc}
     torch.save({"state": best, **blob}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
     if shadow is not None:
@@ -1074,6 +1128,8 @@ def load_net(ckpt: Path, dev: torch.device) -> tuple[nn.Module, dict]:
         net.add_hint()
     if blob.get("pos"):
         net.add_pos(blob["tokens"])
+    if blob.get("no_cat"):
+        net.use_image_query(blob["dim"])
     if blob.get("size_head"):  # the category means come back with the weights
         net.add_scale(blob["dim"], torch.zeros(len(blob["vocab"])), blob["unit_mm"])
     net = net.to(dev).eval()
@@ -1172,6 +1228,7 @@ def predict(ckpt: Path, shape: str) -> None:
         print(f"hedge q_min {rule['q_min']} frac {rule['frac']}")
     name = blob.get("encoder", "dinov2b")
     enc = encoder(dev, name)
+    enc_x = encoder(dev, blob["extra"]) if blob.get("extra") else None
     paths = rows("val")
     if not paths:
         raise SystemExit("no eval images")
@@ -1182,6 +1239,8 @@ def predict(ckpt: Path, shape: str) -> None:
         for i in range(0, len(paths), 8):
             chunk = paths[i : i + 8]
             tok = image_tokens(enc, torch.stack([image_tensor(p, ENCODERS[name]) for p in chunk]).to(dev))
+            if blob.get("extra"):  # e.g. depth tokens, appended channel-wise as in training
+                tok = torch.cat([tok, image_tokens(enc_x, torch.stack([image_tensor(p, ENCODERS[blob['extra']]) for p in chunk]).to(dev))], -1)
             cat = torch.tensor(
                 [vocab.get(p.parent.parent.name, unk) for p in chunk],
                 dtype=torch.long,
@@ -1342,6 +1401,10 @@ if __name__ == "__main__":
     ap.add_argument("--deep-sup", type=float, default=0.0, help="train: weight of the extra Chamfer losses on the earlier decoder blocks")
     ap.add_argument("--flip-aug", action="store_true", help="train: use horizontally flipped image tokens for a random half of each batch (run: flipcache)")
     ap.add_argument("--size-hint", action="store_true", help="train: give every query the size of the most similar training objects")
+    ap.add_argument("--no-cat", action="store_true", help="train: no category input; the queries carry the image's global features instead")
+    ap.add_argument("--extra", default="", help="train: a second token cache appended channel-wise, e.g. dav2s (cache --encoder dav2s first)")
+    ap.add_argument("--l1cd", action="store_true", help="train: Chamfer on plain (not squared) distances")
+    ap.add_argument("--feat-noise", type=float, default=0.0, help="train: Gaussian noise on the image tokens, as a share of each token's spread (try 0.1)")
     ap.add_argument("--swd", type=float, default=0.0, help="train: weight of a sliced Wasserstein term next to Chamfer (try 0.5)")
     ap.add_argument("--size-head", type=float, default=0.0, help="train: separate size head; value = weight of its log-size NLL (try 0.01)")
     ap.add_argument("--aug-sets", type=int, default=0, help="augcache: views to cache; train: cycle through that many augmented views (augcache first)")
@@ -1362,7 +1425,7 @@ if __name__ == "__main__":
     elif args.cmd == "augcache":
         augcache(args.encoder, args.aug_sets, args.seed)
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized, args.drop_path, args.attn_drop, args.grid_jitter, args.repulsion, args.ema, args.deep_sup, args.flip_aug, args.size_hint, args.cat_drop, (args.stray_weight, args.miss_weight), args.pos_emb, args.right_handed, args.aug_sets, args.size_head, args.swd)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized, args.drop_path, args.attn_drop, args.grid_jitter, args.repulsion, args.ema, args.deep_sup, args.flip_aug, args.size_hint, args.cat_drop, (args.stray_weight, args.miss_weight), args.pos_emb, args.right_handed, args.aug_sets, args.size_head, args.swd, args.l1cd, args.feat_noise, args.no_cat, args.extra)
     elif args.cmd == "predict":
         if len(args.ckpt) > 1:
             predict_ensemble(args.ckpt)

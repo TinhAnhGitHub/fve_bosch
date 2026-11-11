@@ -2,7 +2,7 @@
 
 usage: python run_exps.py WORK DATA CODE name1 "flags1" name2 "flags2" ...
   WORK  writable folder (outputs land in WORK/out)
-  DATA  folder with train.npz, train_dinov3l.npz, train_mirror.npz (and train_dinov3l384.npz if used)
+  DATA  folder(s), joined with ':', with train.npz, train_dinov3l.npz, train_mirror.npz (and train_dinov3l384.npz if used)
   CODE  folder with atlas.py, geom.py, score2.py, pl_t_s0_ema.pt
 Runs are spread round-robin over the visible GPUs. Every result is scored against pl_t_s0_ema on the
 real-handed shapes (RH=1). WORK/out/summary.txt collects the score lines.
@@ -16,7 +16,8 @@ from pathlib import Path
 
 import torch
 
-work, data, code = map(Path, sys.argv[1:4])
+work, code = Path(sys.argv[1]), Path(sys.argv[3])
+datas = [Path(d) for d in sys.argv[2].split(":")]  # several data folders, joined with ":"
 runs = list(zip(sys.argv[4::2], sys.argv[5::2]))
 root = work / "f3dr"
 atlas = root / "baselines" / "out" / "atlas"
@@ -26,7 +27,7 @@ for f in ("atlas.py", "geom.py"):
     shutil.copy(code / f, root / "baselines" / f)
 shutil.copy(code / "score2.py", q / "score2.py")
 shutil.copy(code / "pl_t_s0_ema.pt", atlas / "pl_t_s0_ema.pt")
-for f in data.glob("*.npz"):
+for f in (f for d in datas for f in d.glob("*.npz")):
     if not (atlas / f.name).exists():
         os.symlink(f, atlas / f.name)
 out = work / "out"

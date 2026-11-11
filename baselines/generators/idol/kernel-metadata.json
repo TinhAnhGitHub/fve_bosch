@@ -1,0 +1,3 @@
+{"id": "eiyuumiru/f3dr-idol", "title": "f3dr-idol", "code_file": "run.py", "language": "python", "kernel_type": "script",
+ "is_private": true, "enable_gpu": true, "enable_internet": true,
+ "dataset_sources": ["eiyuumiru/f3dr-photos", "eiyuumiru/dinov3-vith16plus", "eiyuumiru/f3dr-trainphotos"], "competition_sources": [], "kernel_sources": []}
