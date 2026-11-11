@@ -1,0 +1,9 @@
+{
+  "mode": "size", "epochs": 80, "batch_size": 32, "accumulation": 1,
+  "lr": 0.0003, "precision": "fp32", "seed": 42,
+  "gradient_checkpointing": false, "weight_decay": 0.01,
+  "warmup_fraction": 0.05, "clip_grad": 1.0, "condition_dropout": 0.0,
+  "rank": 16, "alpha": 16, "lora_dropout": 0.0,
+  "posterior_sample": false, "patience": 10, "sigma_sampling": "uniform", "hidden": 256,
+  "size_loss": "radius_mse"
+}

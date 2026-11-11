@@ -1,0 +1,20 @@
+# Install a matching CUDA PyTorch/torchvision pair FIRST; see README.
+numpy==1.26.4
+diffusers==0.32.2
+transformers==4.48.3
+peft==0.14.0
+accelerate==1.3.0
+lightning==2.5.0
+pytorch-lightning==2.5.0
+huggingface-hub==0.28.1
+safetensors==0.5.2
+einops==0.8.1
+pillow==11.1.0
+trimesh==4.6.4
+scipy==1.15.2
+scikit-image==0.25.2
+omegaconf==2.3.0
+jaxtyping==0.2.38
+typeguard==2.13.3
+# Cache encoding additionally needs torch-cluster matching the torch/CUDA wheel.
+# Mesh generation additionally needs diso. Both are described in README.
