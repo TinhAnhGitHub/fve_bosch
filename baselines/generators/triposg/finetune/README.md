@@ -33,6 +33,13 @@ extraction; install it on the CUDA machine before prediction:
 pip install diso
 ```
 
+On the current Colab and Kaggle images (CUDA 13 by default, Ubuntu 24.04) this fails: torch 2.5.1 is built for
+CUDA 12.4 and refuses to build extensions against another major version. Build `diso` against a CUDA 12 toolkit
+installed from NVIDIA's apt repo (12-6 works on Ubuntu 24.04; `cuda-nvcc-12-4` is listed there without its
+libraries, so check that every package has a candidate), with `--no-build-isolation` and `TORCH_CUDA_ARCH_LIST`
+set for the GPU (8.9 for an L4, 7.5 for a T4). `colab/pub_setup.sh` does this on a Colab L4 and
+`cuda12_home()` in `kaggle/run.py` does it on Kaggle.
+
 Set `HF_HOME` and cache/output directories to a disk with sufficient free space.
 Encoding has a separate memory requirement from training, especially at the
 upstream example's 204,800 surface points. The starting recipe uses 32,768 points.
