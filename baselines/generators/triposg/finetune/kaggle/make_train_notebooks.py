@@ -1,22 +1,27 @@
-"""Generate the three Kaggle notebooks that run TripoSG + the epoch-4 LoRA + the size head on the 1,838 training photos.
+"""Generate the Kaggle notebooks that run TripoSG + the epoch-4 LoRA + the size head on the 1,838 training photos.
 
-usage: python make_train_notebooks.py [--selftest]
-Writes train_infer/part1, part2 and part3 next to this file. Each folder has f3dr-tg-train-pN.ipynb and kernel-metadata.json.
-Push one at a time (the account's Kaggle GPU quota resets 2026-11-14 00:00 UTC):
+usage: python make_train_notebooks.py [--selftest] [--owner NAME] [--infer OWNER/SLUG] [--photos OWNER/SLUG] [--parts 1,2,3]
+Writes train_infer/partN (default owner anhanhanhanh) or train_infer_<owner>/partN next to this file. Each folder has
+f3dr-tg-train-pN.ipynb and kernel-metadata.json. Push one at a time:
     kaggle kernels push -p train_infer/part1 --accelerator NvidiaTeslaT4
---selftest checks the generated notebooks and the shard and photo-path logic without Kaggle (standard library only).
+--infer is the dataset with code.tar, size.pt and lora.pt. --photos is the dataset with the training photos, in either layout:
+  * <dataset>/train/train/<group>/<category>/<id>/rgb_industrial.png  (f3dr-tg-raw: our tar of data/f3d/train, unpacked by Kaggle)
+  * a tar named train2042.bin that unpacks to train2042/<id>.png       (eiyuumiru/f3dr-trainphotos)
+--selftest checks the generated notebooks and the shard and photo logic without Kaggle (standard library only).
 
 The 24 shards of about 77 photos are rows[s::24] of the manifest's train rows (finetune/predict.py --split train --shard s
 --num-shards 24). A notebook runs one worker per GPU and each worker does 4 shards in turn, so a finished shard is on disk even
 if the session dies later. Merge all 24 shards afterwards with finetune/merge.py --expect 1838.
 """
+import argparse
 import ast
 import json
 import sys
+import tempfile
 from pathlib import Path
 
-OWNER = "anhanhanhanh"
 HERE = Path(__file__).resolve().parent
+DEFAULT_OWNER = "anhanhanhanh"
 
 # Pure helpers, used verbatim in the notebook and exercised by --selftest.
 SHARDS_SRC = r'''NUM_PARTS, CHUNKS = 3, 4  # 3 notebooks x 2 GPU workers x 4 chunks = 24 shards of about 77 photos
@@ -29,20 +34,35 @@ def part_shards(part):
 
 
 def train_photos(paths):
-    """The raw dataset is <dataset>/train/train/<group>/<category>/<id>/rgb_industrial.png: keep the paths whose inner folder is train."""
+    """Nested layout <dataset>/train/train/<group>/<category>/<id>/rgb_industrial.png: keep the paths whose inner folder is train."""
     return [p for p in paths if p.parents[3].name == "train"]
 
 
 def data_root(photos):
     """The folder predict.py needs as --data: it holds train/<group>/<category>/<id>/rgb_industrial.png (the outer train folder)."""
     return photos[0].parents[4]
+
+
+def link_photos(rows, flat_dir, root):
+    """Flat layout: rows are (id, image path) pairs. Make root/<image path> a symlink to flat_dir/<id>.png; return the ids with no photo."""
+    missing = []
+    for sid, image in rows:
+        src = Path(flat_dir) / f"{sid}.png"
+        if not src.exists():
+            missing.append(sid)
+            continue
+        dst = Path(root) / image
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists():
+            dst.symlink_to(src)
+    return missing
 '''
 
 MD_INTRO = r'''# LoRA inference on the training photos, part __PART__ of 3
 
 TripoSG + the epoch-4 LoRA + our size head, run on the 1,838 training photos (the 204 holdout photos and the 511 public-test photos are done elsewhere). This notebook does one third: 8 of the 24 shards of about 77 photos, one worker per GPU.
 
-* **Add data:** `anhanhanhanh/f3dr-tg-infer` (code, `size.pt`, `lora.pt`) and `anhanhanhanh/f3dr-tg-raw` (the photos). **Internet on.** **Accelerator: GPU T4 x2.**
+* **Add data:** `__INFER__` (code, `size.pt`, `lora.pt`) and `__PHOTOS__` (the photos). **Internet on.** **Accelerator: GPU T4 x2.**
 * **Time:** about 4 hours if a T4 takes about 50 s per photo (that figure is from an earlier TripoSG run; this notebook has not run on Kaggle yet).
 * **Output:** `lora_train_sNN.npz` per shard (`ids`, `pts` in mm, `unit` clouds of radius 1, `radius_mm` from the size head), one log per shard, and `part__PART___summary.json`. The last printed line is `RUN DONE` or `RUN FAILED`.
 * **Caution:** the LoRA and the size head were trained on these objects, so the outputs are in-sample: better than they would be on photos the model has not seen.
@@ -66,7 +86,7 @@ os.environ["HF_HOME"] = str(T / "hf")  # one Hugging Face cache for the pre-down
 VENV = T / "venv"
 PY = str(VENV / "bin" / "python")
 t0 = time.time()
-FT = DATA = SIZE = SHAPE = None  # set by stage()
+FT = DATA = SIZE = SHAPE = FLAT = None  # set by stage()
 
 
 def log(msg):
@@ -98,17 +118,26 @@ STAGE = r'''def stage():
         else:
             src = find_input("predict.py").parents[3]  # .../code/baselines
             sh(f"mkdir -p {code} && cp -r {src} {code}/")
-    photos = train_photos(sorted(Path("/kaggle/input").rglob("rgb_industrial.png")))
-    if not photos:
-        raise RuntimeError("no training photos under /kaggle/input: add the dataset anhanhanhanh/f3dr-tg-raw")
-    if len(photos) != 2042:  # 1,838 training + 204 holdout photos live in the same folder
-        raise RuntimeError(f"expected 2042 photos, found {len(photos)}")
-    ft, data = code / "baselines/generators/triposg/finetune", data_root(photos)
+    ft = code / "baselines/generators/triposg/finetune"
     size, shape = find_input("size.pt"), find_input(f"{ARM}.pt")
     if size is None or shape is None:
-        raise RuntimeError("size.pt or lora.pt missing: add the dataset anhanhanhanh/f3dr-tg-infer")
-    log(f"code {ft}, {len(photos)} photos under {data}, size {size}, shape {shape}")
-    return ft, data, size, shape
+        raise RuntimeError("size.pt or lora.pt missing: add the dataset with the code and checkpoints")
+    nested = train_photos(sorted(Path("/kaggle/input").rglob("rgb_industrial.png")))
+    if nested:  # <dataset>/train/train/<group>/<category>/<id>/rgb_industrial.png
+        if len(nested) != 2042:  # 1,838 training + 204 holdout photos live in the same folder
+            raise RuntimeError(f"expected 2042 photos, found {len(nested)}")
+        data, flat = data_root(nested), None
+    else:  # a tar of flat <id>.png files, unpacked to train2042/
+        blob = find_input("train2042.bin")
+        if blob is None:
+            raise RuntimeError("no training photos under /kaggle/input: add the photos dataset")
+        if not (T / "train2042").exists():
+            sh(f"tar xf {blob} -C {T}")
+        flat = T / "train2042"
+        data = T / "f3d"
+        log(f"{len(list(flat.glob('*.png')))} flat photos in {flat}")
+    log(f"code {ft}, photos {'flat' if flat else 'nested'} under {flat or data}, size {size}, shape {shape}")
+    return ft, data, size, shape, flat
 '''
 
 SETUP = r'''def setup():
@@ -129,6 +158,21 @@ SETUP = r'''def setup():
     # download the pinned weights once, before two workers race for them
     sh(f"cd {FT} && {PY} -c \"import torch; from huggingface_hub import snapshot_download as s; "
        f"m = torch.load('{SIZE}', map_location='cpu', weights_only=False)['metadata']; print(s(m['model'], revision=m['revision']))\"")
+
+
+def prepare_photos():
+    """Make DATA / <image path> exist for every training row; with the flat photo tar, link the files into place."""
+    rows_file = T / "train_rows.json"
+    sh(f"cd {FT} && {PY} -c \"import json, torch; m = torch.load('{SIZE}', map_location='cpu', weights_only=False)['metadata']; "
+       f"json.dump([[r['id'], r['image']] for r in m['rows'] if r['split'] == 'train'], open('{rows_file}', 'w'))\"")
+    rows = json.loads(rows_file.read_text())
+    if FLAT is not None:
+        missing = link_photos(rows, FLAT, DATA)
+    else:
+        missing = [sid for sid, image in rows if not (DATA / image).exists()]
+    if missing:
+        raise RuntimeError(f"{len(missing)} of {len(rows)} training photos not found, for example {missing[:3]}")
+    log(f"{len(rows)} training photos in place under {DATA}")
 '''
 
 RUN = r'''def run():
@@ -159,8 +203,7 @@ RUN = r'''def run():
 VALIDATE = r'''def validate():
     import numpy as np
 
-    n_train = int(sh(f"cd {FT} && {PY} -c \"import torch; m = torch.load('{SIZE}', map_location='cpu', weights_only=False)['metadata']; "
-                     f"print(sum(r['split'] == 'train' for r in m['rows']))\"").strip().splitlines()[-1])
+    n_train = len(json.loads((T / "train_rows.json").read_text()))
     shards = part_shards(PART)
     expect = sum(1 for i in range(n_train) if i % NUM_SHARDS in set(shards))
     seen, files = set(), []
@@ -179,8 +222,9 @@ VALIDATE = r'''def validate():
 '''
 
 MAIN = r'''try:
-    FT, DATA, SIZE, SHAPE = stage()
+    FT, DATA, SIZE, SHAPE, FLAT = stage()
     setup()
+    prepare_photos()
     log(f"setup done; part {PART}")
     run()
     validate()
@@ -191,11 +235,12 @@ except Exception as e:
 '''
 
 
-def cells_for(part):
+def cells_for(part, infer, photos):
     config = CONFIG.replace("__SHARDS_SRC__", SHARDS_SRC)
     cells = [("markdown", MD_INTRO), ("code", config), ("code", STAGE), ("code", SETUP), ("code", RUN), ("code", VALIDATE),
              ("code", MAIN)]
-    return [(kind, src.replace("__PART__", str(part))) for kind, src in cells]
+    return [(kind, src.replace("__PART__", str(part)).replace("__INFER__", infer).replace("__PHOTOS__", photos))
+            for kind, src in cells]
 
 
 def notebook(cells):
@@ -211,23 +256,28 @@ def notebook(cells):
             "nbformat": 4, "nbformat_minor": 4}
 
 
-def metadata(part):
-    return {"id": f"{OWNER}/f3dr-tg-train-p{part}", "title": f"f3dr-tg-train-p{part}", "code_file": f"f3dr-tg-train-p{part}.ipynb",
+def metadata(owner, part, infer, photos):
+    return {"id": f"{owner}/f3dr-tg-train-p{part}", "title": f"f3dr-tg-train-p{part}", "code_file": f"f3dr-tg-train-p{part}.ipynb",
             "language": "python", "kernel_type": "notebook", "is_private": True, "enable_gpu": True, "enable_internet": True,
-            "dataset_sources": [f"{OWNER}/f3dr-tg-infer", f"{OWNER}/f3dr-tg-raw"], "competition_sources": [], "kernel_sources": []}
+            "dataset_sources": [infer, photos], "competition_sources": [], "kernel_sources": []}
 
 
-def generate():
-    for part in (1, 2, 3):
-        out = HERE / "train_infer" / f"part{part}"
+def folder_for(owner, part):
+    return HERE / ("train_infer" if owner == DEFAULT_OWNER else f"train_infer_{owner}") / f"part{part}"
+
+
+def generate(owner, infer, photos, parts):
+    for part in parts:
+        out = folder_for(owner, part)
         out.mkdir(parents=True, exist_ok=True)
-        (out / f"f3dr-tg-train-p{part}.ipynb").write_text(json.dumps(notebook(cells_for(part)), indent=1) + "\n", encoding="utf-8")
-        (out / "kernel-metadata.json").write_text(json.dumps(metadata(part), indent=1) + "\n", encoding="utf-8")
+        (out / f"f3dr-tg-train-p{part}.ipynb").write_text(
+            json.dumps(notebook(cells_for(part, infer, photos)), indent=1) + "\n", encoding="utf-8")
+        (out / "kernel-metadata.json").write_text(json.dumps(metadata(owner, part, infer, photos), indent=1) + "\n", encoding="utf-8")
         print("wrote", out)
 
 
-def selftest(n_train=1838):
-    ns = {}
+def selftest(owner, parts, n_train=1838):
+    ns = {"Path": Path}  # the notebook's config cell imports Path before the helpers
     exec(SHARDS_SRC, ns)  # noqa: S102
     part_shards, num = ns["part_shards"], ns["NUM_SHARDS"]
     everything = sorted(s for p in (1, 2, 3) for s in part_shards(p))
@@ -242,21 +292,48 @@ def selftest(n_train=1838):
     assert photos == [p], photos
     assert ns["data_root"](photos) == Path("/kaggle/input/f3dr-tg-raw/train"), ns["data_root"](photos)
     assert ns["data_root"](photos) / "train/bakery/bagel/mf3d_bagel_001/rgb_industrial.png" == p  # what predict.py opens
-    print("photo filter and data root OK")
-    for part in (1, 2, 3):
-        folder = HERE / "train_infer" / f"part{part}"
+    print("nested photo filter and data root OK")
+    with tempfile.TemporaryDirectory() as tmp:  # the flat layout: train2042/<id>.png linked into train/<group>/<category>/<id>/
+        flat, root = Path(tmp) / "train2042", Path(tmp) / "f3d"
+        flat.mkdir()
+        for sid in ("mf3d_bagel_001", "omni_apple_002"):
+            (flat / f"{sid}.png").write_bytes(b"png")
+        rows = [("mf3d_bagel_001", "train/bakery/bagel/mf3d_bagel_001/rgb_industrial.png"),
+                ("omni_apple_002", "train/fruits/apple/omni_apple_002/rgb_industrial.png"),
+                ("omni_pear_003", "train/fruits/pear/omni_pear_003/rgb_industrial.png")]
+        missing = ns["link_photos"](rows, flat, root)
+        assert missing == ["omni_pear_003"], missing
+        assert ns["link_photos"](rows, flat, root) == ["omni_pear_003"]  # a second run changes nothing
+        for sid, image in rows[:2]:
+            assert (root / image).is_symlink() and (root / image).read_bytes() == b"png", image
+    print("flat photo linking OK")
+    for part in parts:
+        folder = folder_for(owner, part)
         meta = json.loads((folder / "kernel-metadata.json").read_text())
         nb = json.loads((folder / meta["code_file"]).read_text())
-        assert meta["id"].endswith(f"p{part}") and meta["kernel_type"] == "notebook" and meta["enable_gpu"] and meta["enable_internet"]
+        assert meta["id"] == f"{owner}/f3dr-tg-train-p{part}" and meta["kernel_type"] == "notebook"
+        assert meta["enable_gpu"] and meta["enable_internet"] and len(meta["dataset_sources"]) == 2, meta
         for k, c in enumerate(nb["cells"]):
             if c["cell_type"] == "code":
                 ast.parse("".join(c["source"]), filename=f"part{part} cell {k}")
-        assert f"PART = {part}" in "".join(nb["cells"][1]["source"]) and "__PART__" not in json.dumps(nb)
-        print(f"part{part}: {len(nb['cells'])} cells parse, metadata OK ({meta['id']})")
+        text = json.dumps(nb)
+        assert f"PART = {part}" in "".join(nb["cells"][1]["source"]) and "__PART__" not in text
+        assert "__INFER__" not in text and "__PHOTOS__" not in text and meta["dataset_sources"][0] in text
+        print(f"{owner} part{part}: {len(nb['cells'])} cells parse, metadata OK ({meta['id']}, inputs {meta['dataset_sources']})")
 
 
 if __name__ == "__main__":
-    if "--selftest" in sys.argv:
-        selftest()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--owner", default=DEFAULT_OWNER)
+    ap.add_argument("--infer", help="dataset with code.tar, size.pt, lora.pt (default OWNER/f3dr-tg-infer)")
+    ap.add_argument("--photos", help="dataset with the training photos (default anhanhanhanh/f3dr-tg-raw)")
+    ap.add_argument("--parts", default="1,2,3")
+    a = ap.parse_args()
+    infer = a.infer or f"{a.owner}/f3dr-tg-infer"
+    photos = a.photos or f"{DEFAULT_OWNER}/f3dr-tg-raw"
+    parts = [int(x) for x in a.parts.split(",")]
+    if a.selftest:
+        selftest(a.owner, parts)
     else:
-        generate()
+        generate(a.owner, infer, photos, parts)

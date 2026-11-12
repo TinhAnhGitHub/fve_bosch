@@ -1,0 +1,16 @@
+{
+ "id": "eiyuumiru/f3dr-tg-train-p1",
+ "title": "f3dr-tg-train-p1",
+ "code_file": "f3dr-tg-train-p1.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": true,
+ "dataset_sources": [
+  "eiyuumiru/f3dr-tg-infer",
+  "eiyuumiru/f3dr-trainphotos"
+ ],
+ "competition_sources": [],
+ "kernel_sources": []
+}
