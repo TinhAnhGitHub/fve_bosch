@@ -16,6 +16,7 @@ from pathlib import Path
 ARMS = ["lora"]  # set by the push step; arm "pretrained" needs no <arm>.pt
 W, T = Path("/kaggle/working"), Path("/kaggle/temp")
 T.mkdir(exist_ok=True)
+os.environ["HF_HOME"] = str(T / "hf")  # one Hugging Face cache for the pre-download in setup() and for both workers
 VENV = T / "venv"
 PY = str(VENV / "bin" / "python")
 t0 = time.time()

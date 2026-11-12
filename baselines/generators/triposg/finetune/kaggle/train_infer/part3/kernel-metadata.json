@@ -1,0 +1,16 @@
+{
+ "id": "anhanhanhanh/f3dr-tg-train-p3",
+ "title": "f3dr-tg-train-p3",
+ "code_file": "f3dr-tg-train-p3.ipynb",
+ "language": "python",
+ "kernel_type": "notebook",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_internet": true,
+ "dataset_sources": [
+  "anhanhanhanh/f3dr-tg-infer",
+  "anhanhanhanh/f3dr-tg-raw"
+ ],
+ "competition_sources": [],
+ "kernel_sources": []
+}
