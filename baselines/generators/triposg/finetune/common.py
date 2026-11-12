@@ -159,6 +159,9 @@ def restore_model(model, state, mode):
         result = set_peft_model_state_dict(model, state)
         if result.unexpected_keys:
             raise ValueError(result.unexpected_keys)
+        missing = [k for k in result.missing_keys if "lora_" in k]
+        if missing:
+            raise ValueError(f"{len(missing)} LoRA weights not restored, e.g. {missing[:3]}")
     else:
         model.load_state_dict(state, strict=True)
 

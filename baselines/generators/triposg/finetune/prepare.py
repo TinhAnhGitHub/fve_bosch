@@ -46,11 +46,25 @@ def manifest(args):
         hashes[row["mesh_sha256"]] = g
     for row in rows:
         row["group"] = find(row["group"])
-    unique = sorted({r["group"] for r in rows})
-    np.random.default_rng(args.seed).shuffle(unique)
-    validation = set(unique[:max(1, round(len(unique) * args.val_fraction))])
-    for row in rows:
-        row["split"] = "val" if row["group"] in validation else "train"
+    if getattr(args, "val_ids", None):
+        # Fixed comparison holdout (one id per line). Training rows that share a group or an exact
+        # mesh with a holdout row are excluded, so nothing near-identical can leak into training.
+        wanted = {line.strip() for line in args.val_ids.read_text().splitlines() if line.strip()}
+        missing = wanted - seen
+        if missing:
+            raise ValueError(f"--val-ids not in the data: {sorted(missing)[:5]} ({len(missing)} total)")
+        validation = {r["group"] for r in rows if r["id"] in wanted}
+        for row in rows:
+            if row["id"] in wanted:
+                row["split"] = "val"
+            else:
+                row["split"] = "excluded" if row["group"] in validation else "train"
+    else:
+        unique = sorted({r["group"] for r in rows})
+        np.random.default_rng(args.seed).shuffle(unique)
+        validation = set(unique[:max(1, round(len(unique) * args.val_fraction))])
+        for row in rows:
+            row["split"] = "val" if row["group"] in validation else "train"
     if not any(r["split"] == "train" for r in rows):
         raise ValueError("Need at least two distinct object groups")
     write_json(args.output, dict(schema=SCHEMA, seed=args.seed, rows=rows))
@@ -75,6 +89,7 @@ def encode(args):
     doc = read_json(args.manifest)
     if doc["schema"] != SCHEMA:
         raise ValueError("Unsupported manifest schema")
+    encoded = [r for r in doc["rows"] if r["split"] != "excluded"]  # excluded rows are never trained or scored
     root, out = args.data.resolve(), args.output.resolve()
     if out.exists() and any(out.iterdir()):
         raise ValueError("Use an empty output directory; never mix cache versions")
@@ -85,7 +100,7 @@ def encode(args):
                                                    revision=MODEL_REVISION)
     # Stage 1: image features. No VAE on GPU yet.
     with torch.no_grad():
-        for row in doc["rows"]:
+        for row in encoded:
             path = root / row["image"]
             if digest(path) != row["image_sha256"]:
                 raise ValueError(f"Image changed since manifest: {path}")
@@ -98,7 +113,7 @@ def encode(args):
                                          torch_dtype=torch.float32).cuda().eval().requires_grad_(False)
     # Stage 2: VAE input is (B,N,6), XYZ + surface normal.
     with torch.no_grad():
-        for row in doc["rows"]:
+        for row in encoded:
             path = root / row["mesh"]
             if digest(path) != row["mesh_sha256"]:
                 raise ValueError(f"Mesh changed since manifest: {path}")
@@ -130,6 +145,7 @@ def main():
     m.add_argument("--data", type=Path, required=True)
     m.add_argument("--output", type=Path, required=True)
     m.add_argument("--groups", type=Path)
+    m.add_argument("--val-ids", type=Path, help="Fixed holdout ids, one per line; overrides --val-fraction")
     m.add_argument("--seed", type=int, default=42)
     m.add_argument("--val-fraction", type=float, default=0.1)
     e = sub.add_parser("encode")

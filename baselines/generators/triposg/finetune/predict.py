@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import trimesh
+from huggingface_hub import snapshot_download
 
 from common import (SCHEMA, SizeHead, configure_transformer, metric_points,
                     prepared_image, restore_model, upstream)
@@ -25,7 +26,16 @@ def main():
     p.add_argument("--guidance", type=float, default=7.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--precision", choices=["fp16", "bf16", "fp32"], default="fp16")
+    # Mesh-extraction grid. Upstream default 8/9 (512^3) takes ~50 s/object on an A100;
+    # 7/8 (256^3) was used for the zero-shot TripoSG holdout run and is ample for 8192 surface points.
+    p.add_argument("--dense-depth", type=int, default=8)
+    p.add_argument("--hierarchical-depth", type=int, default=9)
+    # One process per GPU: shard K of N takes rows K, K+N, ...; sharded runs write only the npz (merge.py packs the zip).
+    p.add_argument("--shard", type=int, default=0)
+    p.add_argument("--num-shards", type=int, default=1)
     args = p.parse_args()
+    if not 0 <= args.shard < args.num_shards:
+        p.error("need 0 <= shard < num-shards")
     if args.steps <= 0:
         p.error("steps must be positive")
     if args.output.exists():
@@ -38,7 +48,9 @@ def main():
         raise ValueError("Expected size-phase checkpoint")
     meta = size["metadata"]
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[args.precision]
-    pipe = TripoSGPipeline.from_pretrained(meta["model"], revision=meta["revision"], torch_dtype=dtype).to("cuda")
+    # A repo id fails in diffusers' download check (custom scheduler in model_index.json); a local snapshot loads like upstream's script.
+    weights = snapshot_download(meta["model"], revision=meta["revision"])
+    pipe = TripoSGPipeline.from_pretrained(weights, torch_dtype=dtype).to("cuda")
     if args.shape:
         shape = torch.load(args.shape, map_location="cpu", weights_only=False)
         if shape["schema"] != SCHEMA or shape["phase"] != "shape" or shape["cache_hash"] != size["cache_hash"]:
@@ -54,6 +66,7 @@ def main():
         rows = [dict(id=image.parent.name, image=str(image.relative_to(args.data))) for image in images]
     else:
         rows = [r for r in meta["rows"] if r["split"] == args.split]
+    rows = rows[args.shard::args.num_shards]
     if not rows:
         raise ValueError("No input objects")
     ids, clouds, units, radii = [], [], [], []
@@ -65,6 +78,7 @@ def main():
             verts, faces = pipe(image=image, num_tokens=meta["tokens"],
                     num_inference_steps=args.steps, guidance_scale=args.guidance,
                     generator=torch.Generator(device="cuda").manual_seed(args.seed),
+                    dense_octree_depth=args.dense_depth, hierarchical_octree_depth=args.hierarchical_depth,
                     use_flash_decoder=False).samples[0]
             mesh = trimesh.Trimesh(verts, faces, process=False)
             if len(mesh.faces) == 0:
@@ -81,7 +95,10 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.output, ids=np.array(ids), pts=np.stack(clouds), unit=np.stack(units),
              radius_mm=np.array(radii), seed=args.seed, steps=args.steps,
+             dense_depth=args.dense_depth, hierarchical_depth=args.hierarchical_depth,
              cache_hash=size["cache_hash"], shape_checkpoint=str(args.shape or "pretrained"))
+    if args.num_shards > 1:
+        return
     # Challenge archive uses existing repository point-count/path validation.
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
     from geom import pack
