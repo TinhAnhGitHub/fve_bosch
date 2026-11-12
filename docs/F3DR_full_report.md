@@ -1,6 +1,6 @@
 # Food 3D Reconstruction: full technical report
 
-Bosch AI Challenge, Food 3D Reconstruction (F3DR). Status as of 2026-11-11, about 22:00. New since 2026-11-10: cloud training runs (section 9.7), handedness-aware mixes and the new best 43.85 (section 9.8), pretrained 3D generators (section 9.9), and the new plan (section 17).
+Bosch AI Challenge, Food 3D Reconstruction (F3DR). Status as of 2026-11-12, about 21:00. New since 2026-11-10: cloud training runs (section 9.7), handedness-aware mixes and the new best 43.85 (section 9.8), pretrained 3D generators (section 9.9), the new plan (section 17), and the fine-tuned TripoSG shape model with its size analysis (section 18).
 
 This report describes the input and output format, data processing, model architecture, training, evaluation and every experiment so far. It is meant to be read by someone who has not seen the project and is asked to suggest improvements. It contains aggregate statistics only: no dataset images, meshes or point clouds.
 
@@ -13,6 +13,7 @@ This report describes the input and output format, data processing, model archit
 | Best single model, leaderboard | **52.89** (`v27`, positional embedding + right-handed targets, seed 1); `v33` no category input 54.01 |
 | Best single model, local | 33.5 (`s_l1_s0`, L1 Chamfer), but it scored 59.76 on the leaderboard. Local scores do not rank single models (section 8.2) |
 | Most promising new direction | SAM 3D shapes at the true size: about 23 against about 49 for our model on 92 holdout objects (section 9.9). Size is the missing piece |
+| New (2026-11-12): fine-tuned TripoSG | LoRA adapter on our 1,838 training objects: shape at the **true** size 24.5 (median 13.1) against 38.9 (17.4) for our best single model on the same 204 holdout objects. With our own size head it scores 79.3, because that size head is no better than the median size of the food category. Not yet run on the public test; nothing uploaded (section 18) |
 | Upload next | `v35_e6_mix5_nocat` (RH-Mix5 + no-category model) and `v34_nocat_depth_s0_ema`, both built and checked, not uploaded |
 | Running | IDOL generator on Kaggle (account 3): 204 holdout, then all 2,042 training photos |
 
@@ -644,6 +645,7 @@ Findings:
 - **Why our model survives an uncertain size and a crisp surface does not:** our models pile up to 43% of their points into dense clumps near the surface and spread the rest. Under squared Chamfer that is a hedge. A clean generator surface at a wrong size has no hedge. The model that clumps most (v27) scored best on the leaderboard; L1 Chamfer (0.3% clumped) scored worst.
 - **Weak spots:** generators close open half-shell scans (durian), and TripoSG flattens bowls.
 - Comparison images and point clouds: `f3d_triposg_compare/` (204), `f3d_sam3d_compare/` (92), each with `index.csv`.
+- **Fine-tuning TripoSG on our training set (2026-11-12) cut its shape error at the true size from 29.6 to 24.5** on the 204 holdout objects (section 18). Size is still the problem there too.
 
 ## 10. Full submission history
 
@@ -995,3 +997,141 @@ Tweaking our decoder has stopped paying off, and pretrained generators draw much
 5. **Fine-tuning a generator** only if shape becomes the main error once size is solved. TRELLIS is the only one with released training code; IDOL lacks its shape encoder.
 
 Open checks before relying on a generator in a final submission: whether the competition allows external pretrained models, and the SAM License terms for Bosch.
+
+Update 2026-11-12: step 5 was tried early, with TripoSG (MIT licence), and it worked for shape (section 18). The size part of steps 2 and 3 is now the bottleneck, as planned.
+
+## 18. Fine-tuned TripoSG as the shape source (2026-11-12)
+
+TripoSG's transformer was adapted to our photos with LoRA, and the shape it draws was scored on the fixed 204 holdout objects. Size comes from a separate small head. Code: `baselines/generators/triposg/finetune/` (branch `f3dr_generators`, commit `678c98a`). Everything here is aggregate statistics.
+
+### 18.1 Setup
+
+| Item | Value |
+|---|---|
+| Split | 2,042 training objects: 1,838 train and the fixed 204 holdout (`baselines/sam3d/holdout_ids.txt`), the same 204 as in every other section. No train object shared an exact mesh with a holdout object (the excluded count was zero) |
+| Cache | TripoSG VAE posterior, 2,048 latent tokens × 64 channels, 32,768 surface points per object, PCA pose, mesh unit 1.0 mm. Photo preprocessing: the full 1024 × 1024 RGB photo (these photos have no alpha mask), white square padding of 10% |
+| Hardware | Colab A100 80 GB, one session (`tg`), stopped 2026-11-12 about 18:25 Vietnam time |
+| Objective | Rectified flow: x = (1 − σ)·latent + σ·noise, target = latent − noise, model time 1000σ, σ uniform, 10% condition dropout, latent sampled from the VAE posterior. Matches the sampler in TripoSG's own scheduler (`x + (σ − σ_next)·v`, shift 1) |
+| Size head | Small network on TripoSG's DINOv2 image features (257 × 1024 tokens), log-radius target. Best epoch 30 |
+| Full fine-tune | All transformer weights, A100 config. 4 epochs run; validation loss best at epoch 0, so `full` = epoch 0 and `fulllast` = epoch 3 |
+| LoRA | Rank 16, alpha 16, dropout 0.05, lr 5e-5, batch 1 × 16 accumulation, bf16, at most 20 epochs, patience 5, on `to_q`, `to_k`, `to_v`, `to_out.0`. Ran 7 full epochs (about 20 min each, 2 h 17 min in all), then we stopped it in epoch 7. **Best epoch 4**, exported as a 42 MB file |
+| Inference | fp16, 50 steps, guidance 7, mesh grid depth 7/8 (256³), seed 42, then 8,192 points sampled from the mesh. 204 objects × 4 arms at once on one A100 took 88–91 min per arm (about 26 s per object per arm while sharing) |
+
+### 18.2 The flow-matching loss barely moves, and it is not a bug
+
+Validation loss on the 204 holdout objects, fixed noise per object, no condition dropout:
+
+| Model | Validation loss |
+|---|---|
+| Pretrained TripoSG, untrained | 0.8847 |
+| LoRA, best (epoch 4) | 0.8838 (−0.1%) |
+| Full fine-tune, best (epoch 0) | 0.8824 (−0.3%) |
+
+LoRA by epoch (0 to 6): 0.8846, 0.8844, 0.8839, 0.8842, 0.8839, 0.8841, 0.8840. Full fine-tune (0 to 3): 0.8824, 0.8838, 0.8851, 0.8842. Training loss is about 1.39–1.40 because of condition dropout and posterior sampling.
+
+Checks run on the VM to rule out a bug:
+
+| Check | Result |
+|---|---|
+| Loss with the sign of the target flipped | 3.06 (against 0.88), so the sign is right |
+| Zero predictor (target variance) | 1.45, so the model is far from ignoring the input or time |
+| Overfit one object, LoRA at lr 3e-4, 400 steps | Mean loss falls from 0.91 to about 0.38–0.43, so gradients reach the adapters |
+| LoRA weights at epoch 4 | All 168 `lora_B` matrices are non-zero; the update is 0.65% of the weight norm (median, largest 1.2%) |
+
+Pretrained loss by noise level σ (the lower the σ, the cleaner the input):
+
+| σ | 0–0.2 | 0.2–0.4 | 0.4–0.6 | 0.6–0.8 | 0.8–1.0 |
+|---|---|---|---|---|---|
+| Pretrained loss | 1.01 | 0.95 | 0.98 | 0.88 | 0.56 |
+| Zero predictor | 1.45 | 1.45 | 1.45 | 1.46 | 1.45 |
+
+We believe the loss is almost flat because the random noise in the target cannot be predicted (about 1.0 at low σ) and the part that depends on the photo is small. This is an explanation, not something we measured directly. The loss cannot tell good shapes from bad ones here: the shape error below fell fivefold while the loss fell 0.1%. Judge these runs on geometry, not on loss.
+
+### 18.3 Holdout shape and score (`evaluate.py`, 204 objects)
+
+CD-L2 in mm², lower is better. All arms use the same size head, so their size error is identical (radius error 55.9 mm²). "Predicted size" is a submission-like score; "true size" rescales each cloud to the real radius, so it measures shape alone.
+
+| Arm | Predicted size, mean / median | True size, mean / median |
+|---|---|---|
+| Pretrained | 154.98 / 79.49 | 120.78 / 55.48 |
+| **LoRA, epoch 4** | **79.27** / 33.41 | **24.17** / **11.87** |
+| Full fine-tune, best (epoch 0) | 82.48 / 33.35 | 26.88 / 12.51 |
+| Full fine-tune, last (epoch 3) | 84.47 / 31.96 | 26.23 / 12.39 |
+
+LoRA beat the pretrained model on 167 of 204 objects at the predicted size (mean −75.7, median −23.8) and on 185 of 204 at the true size (mean −96.6, median −33.5). The full fine-tune (epoch 0) beat it on 193 of 204 at the true size. LoRA is at least as good as the full fine-tune on both means, from a 42 MB file instead of 5.7 GB.
+
+`evaluate.py` is a local diagnostic: 24 rotation starts, 20 ICP iterations each, 8,192 truth points. It is not the report's strict scorer, so these numbers are not comparable with sections 8 to 11.
+
+### 18.4 The report's own scorer on the LoRA clouds
+
+`baselines/tools/trellis_score.py` on the same 204 objects, centre plus 10 ICP steps from the given pose:
+
+| Arm | CD-L2 mean | Median |
+|---|---|---|
+| Atlas single model `v27` (a member of RH-Mix5) | 38.87 | 17.4 |
+| LoRA at the true size, best of 24 rotations | **24.47** | 13.1 |
+| LoRA at the RMS radius of Atlas's cloud, rotated onto Atlas's cloud | 189.80 | 109.9 |
+| Same, then ICP with scale clamped to ±15% | 197.24 | 112.0 |
+
+Atlas scores 38.87 here, matching the 38.9 of section 9.9, so this is the same scorer and the same objects. LoRA is better than Atlas on only 9% of objects at Atlas's size.
+
+The "Atlas's cloud" rows use the cloud's own RMS radius. Atlas's clouds are hedged and come out about 1/1.35 of the true size, so this is the worst calibrated way to size a crisp surface. For zero-shot TripoSG the same arm gave 188.6, a global ×1.35 factor gave 108.4 and a 3-size hedge gave 91.5 (section 9.9). Those two variants have **not** been run for LoRA yet.
+
+Shape at the true size, other generators (different object sets, so only roughly comparable): LoRA 24.5 / 13.1 on 204; zero-shot TripoSG 29.6 / 11.7 on 204, with BiRefNet masks; IDOL 24.1 / 11.5 on 204; SAM 3D about 23 on 92. Same-subset comparison with SAM 3D is still to do.
+
+### 18.5 Why the predicted size fails
+
+True radius of the holdout objects: median 29.1 mm. Radius error of three ways to guess the size:
+
+| Size guess | Median error | Within 10% | Off by more than 30% |
+|---|---|---|---|
+| One size for everything (train median) | 28% | 16% | 47% |
+| Median size of the object's food category | 13% | 42% | 19% |
+| **Our size head** | 13% | 41% | 18% |
+
+The size head is no better than the category median, so it has learned the category's typical size and nothing from the photo itself. Effect on LoRA's score, holdout objects grouped by size error:
+
+| Size error | Objects | CD-L2 at predicted size | CD-L2 at true size |
+|---|---|---|---|
+| 0–10% | 84 | 23.4 | 19.8 |
+| 10–20% | 54 | 56.8 | 28.6 |
+| 20–30% | 29 | 94.0 | 26.2 |
+| over 30% | 37 | 227.5 | 26.1 |
+
+The shape scores about the same in every row (20–29), while the predicted-size score rises from 23 to 228. The 37 objects with the largest size error add about 40 points to the mean of 79. The size head was trained without dropping the oversized OmniObject3D labels (the finetune code has no such filter), which our Atlas work found important (section 9.1, `v5`).
+
+### 18.6 Caveats
+
+1. **The pretrained arm saw unmasked photos.** Our photos have no mask and the pipeline pads the full frame, while the zero-shot TripoSG run in section 9.9 used BiRefNet masks (29.6 at true size). So part of LoRA's fivefold gain over "pretrained" in 18.3 may be learning to ignore the background. The fair comparison is 24.5 (LoRA) against 29.6 (masked zero-shot), a gain of 17%, and the two use different scorers. Not yet tested: LoRA on masked photos, or the pretrained arm with a mask.
+2. **One LoRA run, one seed (42).** Epoch 4's validation loss beats epochs 2 to 6 by at most 0.0003, so the choice of epoch 4 is within noise. The best epoch of each arm was picked on the same 204 objects that score it.
+3. **No leaderboard number exists.** Nothing was uploaded and the public test was not run. The 79.3 is a holdout figure and, by section 8.2, leaderboard scores have run 1.3 to 1.7 times local ones for Atlas, but that ratio is unknown for this pipeline.
+4. **Full fine-tune weights.** The fp32 files (5.7 GB each) were lost when the VM was stopped. fp16 copies are in the Kaggle dataset below. Inference runs in fp16, so those copies give the same clouds.
+
+### 18.7 Public test: status and how to run it
+
+Not run. Kaggle refused the kernel on 2026-11-12: this account had used 36.93 of its 30 GPU hours, and the quota resets at 2026-11-14 00:00 UTC (07:00 Vietnam time). Everything needed is in place:
+
+| Item | Where |
+|---|---|
+| Private Kaggle dataset | `anhanhanhanh/f3dr-tg-infer`: `code.tar`, the 511 public-test photos (`eval.tar`, 511 `rgb_industrial.png` checked), `size.pt`, `lora.pt`, `full.pt`, `fulllast.pt` (the last two in fp16) |
+| Kernel | `finetune/kaggle/run.py` and `kernel-metadata.json` (id `anhanhanhanh/f3dr-tg-public`, arm list `["lora"]`); two T4s, one shard each, then `merge.py` writes the zip |
+| Push | `kaggle kernels push -p <folder with run.py and kernel-metadata.json> --accelerator NvidiaTeslaT4` |
+| Local copies | `baselines/out/triposg/holdout/`: holdout clouds and scores for all four arms, size head, LoRA file, training logs (`logs/runlogs.tgz`), `metadata.json` |
+
+The kernel has never run: its setup (torch 2.5.1 + cu124, `diso` built for the T4's sm_75) is only tested on Colab. Expect about 50 s per photo on a T4 (section 9.9), so roughly 3.5 hours on two T4s, which is an estimate and not a measurement. A Colab A100 would take about 1 to 2 hours (about 6.6 s per object of GPU time, measured above).
+
+### 18.8 What to try next
+
+1. **Free, on this machine:** how accurate is Atlas's own size on the same 204 objects? If it beats the category median, LoRA can use it.
+2. **Free, on this machine:** place the LoRA shape at several sizes around Atlas's size (hedge), at a calibrated factor, and mix some LoRA points into RH-Mix5. Judge each against RH-Mix5's own holdout score under the same strict scorer.
+3. **Size model retrain, on Colab or Kaggle:** drop the oversized training labels, use DINOv3 features as Atlas does, average several models. A bigger network on the same inputs is unlikely to help, because the category median already matches it.
+4. **Only if one of these beats RH-Mix5 on the holdout:** run LoRA on the 511 public photos and build that combination as a zip. Do not upload a lone LoRA + size-head zip: its holdout score of 79 would rank far below 43.85.
+5. Remove the mask confound in 18.6 (masked photos) and add a second LoRA seed before relying on the 24.5.
+
+### 18.9 Practical notes from the run
+
+- Colab's `exec` connection drops often. Run long jobs detached on the VM and poll them.
+- Loading TripoSG from the Hugging Face repo id fails on its custom scheduler entry. `predict.py` now downloads a snapshot and loads from the local path.
+- `predict.py` writes its output only after the last object, so a half-finished arm has no score. Scoring one arm locally takes 10 to 14 minutes on 14 CPU cores.
+- `predict.py` has `--shard` and `--num-shards`, and `merge.py` joins the shards into the challenge zip (exactly 8,192 points per object, `geometry/{id}.ply`).
+- Scripts behind the numbers are in `finetune/analysis/`: `fm_diag.py` and `lora_diag.py` (18.2, run on the GPU VM), `score_local.py` (18.3, parallel version of `evaluate.py`), `size_baselines.py` and `radius_check.py` (18.5). The last three run from `baselines/out/triposg/holdout/` and need `metadata.json` and the `*_val.npz` files there. The 18.4 numbers come from `trellis_score.py` run on `lora_val.npz`.
