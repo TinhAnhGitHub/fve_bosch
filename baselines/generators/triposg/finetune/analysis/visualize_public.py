@@ -2,7 +2,8 @@
 object is the photo plus the model output seen from three angles, with the size our size head chose.
 
 usage: visualize_public.py SHARD_DIR DATA_DIR OUT_DIR
-  SHARD_DIR  folder with the lora_eval_s*.npz shards that finetune/predict.py --shard writes, or one merged lora_eval.npz
+  SHARD_DIR  folder with the shards that finetune/predict.py --shard writes (lora_eval_s*.npz, or lora_eval_n12_s*.npz from the
+             12-way rerun; both kinds may sit together), or one merged lora_eval.npz
   DATA_DIR   data/f3d (the public photos are eval/<group>/<category>/<id>/rgb_industrial.png)
   OUT_DIR    created: objects/<id>.png, ply/<id>.ply, index.csv and index.html
 
@@ -57,13 +58,15 @@ function sortTable(n, numeric) {
 
 def load_clouds(shard_dir):
     merged = shard_dir / "lora_eval.npz"
-    files = [merged] if merged.exists() else sorted(shard_dir.glob("lora_eval_s*.npz"))
+    files = [merged] if merged.exists() else sorted(shard_dir.glob("lora_eval*_s*.npz"))
     if not files:
-        raise SystemExit(f"no lora_eval.npz or lora_eval_s*.npz in {shard_dir}")
+        raise SystemExit(f"no lora_eval.npz or lora_eval*_s*.npz in {shard_dir}")
     clouds = {}
     for f in files:
         z = np.load(f, allow_pickle=False)
         for i, sid in enumerate(z["ids"].tolist()):
+            if sid in clouds:
+                raise SystemExit(f"{sid} is in more than one shard file (found again in {f.name}); the shards overlap")
             clouds[sid] = (z["pts"][i].astype(np.float64), float(z["radius_mm"][i]))
     return clouds, files
 

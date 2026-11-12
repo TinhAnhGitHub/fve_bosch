@@ -140,7 +140,38 @@ STAGE = r'''def stage():
     return ft, data, size, shape, flat
 '''
 
-SETUP = r'''def setup():
+SETUP = r'''def cuda12_home():
+    """torch 2.5.1 is built for CUDA 12.4 but the image's /usr/local/cuda can be 13.x, and torch refuses to build extensions against a
+    different major version. Use a CUDA 12 toolkit that is already installed, else install one from NVIDIA's apt repo."""
+    have = sh("ls -d /usr/local/cuda-12* 2>/dev/null | head -1").strip()
+    if have:
+        return have
+    script = r"""
+set -e
+. /etc/os-release
+apt-get update -qq >/dev/null 2>&1 || true
+PKGS="cuda-nvcc cuda-cudart-dev cuda-cccl cuda-nvrtc-dev cuda-nvtx cuda-profiler-api libcublas-dev libcusparse-dev libcusolver-dev libcurand-dev"
+# a version counts only when EVERY package has an installation candidate: the repo can list cuda-nvcc-12-4 without its libraries
+have_all() { for p in $PKGS; do c=$(apt-cache policy $p-$1 2>/dev/null | sed -n 's/^ *Candidate: //p'); { [ -n "$c" ] && [ "$c" != "(none)" ]; } || return 1; done; return 0; }
+find_v() { for v in 12-4 12-5 12-6 12-8 12-9; do have_all $v && { echo $v; return 0; }; done; return 0; }
+v=$(find_v)
+if [ -z "$v" ]; then
+  n=$(echo $VERSION_ID | tr -d .)
+  wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu$n/x86_64/cuda-keyring_1.1-1_all.deb -O /tmp/ck.deb
+  dpkg -i /tmp/ck.deb >/dev/null
+  apt-get update -qq >/dev/null 2>&1 || true
+  v=$(find_v)
+fi
+if [ -z "$v" ]; then
+  echo "no complete CUDA 12 toolkit in the apt repo"; head -2 /etc/os-release; apt-cache policy cuda-nvcc-12-6 libcublas-dev-12-6 | head -8; exit 1
+fi
+apt-get install -y -qq --no-install-recommends $(for p in $PKGS; do echo $p-$v; done) >/tmp/apt.log 2>&1 || { tail -5 /tmp/apt.log; exit 1; }
+echo /usr/local/cuda-$(echo $v | tr - .)
+"""
+    return sh(script, tail=300).strip().splitlines()[-1]
+
+
+def setup():
     log(sh("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader").strip().replace("\n", " | "))
     sh("pip install -q uv")
     sh(f"uv venv -q --python 3.12 --python-preference only-managed {VENV}")
@@ -150,7 +181,7 @@ SETUP = r'''def setup():
     if not (T / "TripoSG").exists():
         sh(f"git clone -q https://github.com/VAST-AI-Research/TripoSG.git {T}/TripoSG")
     sh(f"git -C {T}/TripoSG checkout -q fc5c40990181e2a756c4e0b1c2f4d6b5202faf8c")
-    nvcc = sh("ls -d /usr/local/cuda-12* /usr/local/cuda 2>/dev/null | head -1").strip().splitlines()[-1]
+    nvcc = cuda12_home()
     log(sh(f"{nvcc}/bin/nvcc --version | tail -1").strip())
     sh(f"CUDA_HOME={nvcc} PATH={nvcc}/bin:$PATH TORCH_CUDA_ARCH_LIST=7.5 MAX_JOBS=4 "
        f"uv pip install --python {PY} --no-build-isolation diso", tail=600)
