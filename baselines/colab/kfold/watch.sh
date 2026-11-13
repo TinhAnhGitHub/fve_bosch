@@ -5,7 +5,7 @@ before=$(cat dl/*/summary.txt 2>/dev/null | md5sum)
 declare -A miss
 while true; do
   sleep 600
-  for s in kf kf2 kf3; do
+  for s in ${SESSIONS:-kf kf2 kf3}; do
     if colab sessions 2>/dev/null | grep -q "^\[$s\]"; then
       miss[$s]=0
       timeout 90 colab exec -s $s --timeout 60 -f ping.py > /dev/null 2>&1
