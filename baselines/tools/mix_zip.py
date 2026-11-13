@@ -4,12 +4,15 @@
 # ///
 """Submission zip for the 511 public photos from one checkpoint or an aligned point mix of several.
 
-usage: mix_zip.py OUT_ZIP CKPT [CKPT ...]
+usage: mix_zip.py OUT_ZIP MEMBER [MEMBER ...]
+  MEMBER is a checkpoint, or several joined by commas: a pooled member (e.g. the 5 fold models of a recipe), whose
+  clouds are first mixed among themselves (aligned to the group's first checkpoint) and then count as one member.
 
-One checkpoint: its clouds as they are. Several: each member is aligned per photo to the first one
+One member: its clouds as they are. Several: each member is aligned per photo to the first one
 (best of the 8 axis sign flips, then rigid ICP; mixlib.align_to, as in RH-Mix5) and the points are
 pooled with an equal share per member (atlas.mix, index stride), exactly 8,192 per photo.
-Fine-tuned checkpoints (train --finetune) read the photos through their own encoder blocks.
+The first member must be right-handed (the reference). Fine-tuned checkpoints (train --finetune) read the
+photos through their own encoder blocks.
 """
 import sys
 from pathlib import Path
@@ -25,8 +28,18 @@ from geom import pack  # noqa: E402
 from mixlib import align_to  # noqa: E402
 
 
+def aligned_mix(clouds: list[torch.Tensor], i: int, dev: torch.device) -> np.ndarray:
+    """Photo i: every cloud aligned to the first one, then an equal index-stride share of each."""
+    ref = clouds[0][i].to(dev)
+    if len(clouds) == 1:
+        return ref.cpu().numpy()
+    return mix([ref.cpu().numpy()] + [align_to(c[i].to(dev), ref).cpu().numpy() for c in clouds[1:]])
+
+
 def main() -> None:
-    out, ckpts = Path(sys.argv[1]), [Path(p) for p in sys.argv[2:]]
+    out = Path(sys.argv[1])
+    groups = [[Path(p) for p in spec.split(",")] for spec in sys.argv[2:]]
+    ckpts = [p for g in groups for p in g]
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     paths = rows("val")
     if len(paths) != 511:
@@ -57,13 +70,14 @@ def main() -> None:
         print(f"{ck.name}: predicted {len(paths)}", flush=True)
         del net, tuner
         torch.cuda.empty_cache()
+    sizes = [len(g) for g in groups]
+    starts = np.cumsum([0] + sizes)
     result = {}
     for i, p in enumerate(paths):
-        ref = clouds[0][i].to(dev)
-        members = [ref] + [align_to(c[i].to(dev), ref) for c in clouds[1:]]
-        result[p.parent.name] = mix([m.cpu().numpy() for m in members]) if len(members) > 1 else ref.cpu().numpy()
+        members = [torch.from_numpy(aligned_mix(clouds[a:b], i, dev))[None] for a, b in zip(starts[:-1], starts[1:])]
+        result[p.parent.name] = aligned_mix(members, 0, dev)
     pack(out, result)
-    print(f"{len(result)} clouds from {len(ckpts)} checkpoint(s) -> {out}")
+    print(f"{len(result)} clouds from {len(groups)} member(s), {len(ckpts)} checkpoint(s) {sizes} -> {out}")
 
 
 if __name__ == "__main__":
