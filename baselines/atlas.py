@@ -1124,6 +1124,9 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             tuner.load_tuned(kept)
         return vtotal / vseen
 
+    import time
+
+    start = time.time()
     for epoch in range(1, epochs + 1):
         net.train()
         rng.shuffle(tr)
@@ -1204,7 +1207,7 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             enc_now = enc_shadow if shadow is not None else (tuner.tuned() if tuner is not None else None)
             snap.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"state": cpu((shadow if shadow is not None else net).state_dict()), **blob, "epoch": epoch, **({"enc_state": cpu(enc_now)} if enc_now is not None else {})}, snap)
-        print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else "") + note, flush=True)
+        print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else "") + note + f"  {time.time() - start:.0f}s", flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
     if best is None:  # nothing held out (--fold all): the final weights
         best, best_enc = cpu(net.state_dict()), (cpu(tuner.tuned()) if tuner is not None else None)

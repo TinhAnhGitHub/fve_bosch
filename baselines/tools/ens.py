@@ -18,7 +18,7 @@ import torch
 
 root, mode = Path(sys.argv[1]), sys.argv[2]
 sys.path.insert(0, str(root / "baselines"))
-from atlas import ENCODERS, _load_cache, encoder, holdout, image_tensor, image_tokens, kabsch, load_net, mix, nearest, right_handed, rows
+from atlas import ENCODERS, _load_cache, encoder, holdout, image_tensor, image_tokens, load_net, mix, right_handed, rows
 from geom import pack
 
 dev = torch.device("cuda")
@@ -49,40 +49,8 @@ PLANS = {
     "e6_mix5_nocat": ["v27", "v26", "tds", "ds", "r1", "nocat"],
     "v22_itself": ["tds", "ds", "r1"],  # the 46.35 mix, aligned the same way, for reference
 }
-SIGNS = torch.tensor([[a, b, c] for a in (1, -1) for b in (1, -1) for c in (1, -1)], dtype=torch.float32)
-
-
-@torch.no_grad()
-def cd(q, t):
-    return float(nearest(q, t)[0].mean() + nearest(t, q)[0].mean())
-
-
-@torch.no_grad()
-def align_to(p, ref, iters=10):
-    """Best sign flip (mirrors allowed) of p about its centre, then rigid ICP onto ref."""
-    pc = p - p.mean(0)
-    best, best_d = None, float("inf")
-    for s in SIGNS.to(p.device):
-        q = pc * s + ref.mean(0)
-        d = cd(q[::8], ref[::8])
-        if d < best_d:
-            best, best_d = q, d
-    q = best
-    for _ in range(iters):
-        _, j = nearest(q, ref)
-        R, tr = kabsch(q, ref[j])
-        q = q @ R.T + tr
-    return q
-
-
-@torch.no_grad()
-def strict(pred, t, iters=10):
-    q = pred - pred.mean(0) + t.mean(0)
-    for _ in range(iters):
-        _, j = nearest(q, t)
-        R, tr = kabsch(q, t[j])
-        q = q @ R.T + tr
-    return cd(q, t)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mixlib import align_to, strict  # noqa: E402
 
 
 def member_clouds(names, tokens_fn, cats, n_obj):
