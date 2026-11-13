@@ -757,9 +757,13 @@ def augment_image(path: Path, size: int, rng: np.random.Generator) -> torch.Tens
     PCA-canonical cloud, which does not depend on how the object sits in the picture, so it
     stays the same. The camera auto-frames every object, so zoom does not change its size.
     """
+    return augment_pil(Image.open(path).convert("RGB"), size, rng)
+
+
+def augment_pil(im: Image.Image, size: int, rng: np.random.Generator) -> torch.Tensor:
+    """augment_image on an image already in memory (train --finetune reads the photo pack)."""
     from PIL import ImageEnhance
 
-    im = Image.open(path).convert("RGB")
     w, h = im.size
     bg = tuple(int(v) for v in np.median(np.asarray(im)[:8].reshape(-1, 3), 0))  # backdrop colour along the top edge
     im = im.rotate(float(rng.uniform(-20, 20)), resample=Image.BICUBIC, fillcolor=bg)
@@ -837,6 +841,99 @@ def holdout(n: int) -> tuple[np.ndarray, np.ndarray, np.random.Generator]:
     return order[:cut], order[cut:], rng
 
 
+def split(ids: list[str], folds: Path | None, fold: str) -> tuple[np.ndarray, np.ndarray, np.random.Generator]:
+    """(val, train, rng): the fixed 10% holdout without a fold file; else val = fold `fold` of the file
+    (baselines/tools/make_folds.py) and train = the other folds; fold "all" trains on every object."""
+    if folds is None:
+        return holdout(len(ids))
+    import csv
+
+    with open(folds, newline="") as f:
+        table = {r["id"]: int(r["fold"]) for r in csv.DictReader(f)}
+    if sorted(table) != sorted(ids):
+        raise SystemExit(f"{folds} does not list the same ids as train.npz")
+    of = np.array([table[i] for i in ids])
+    if fold == "all":
+        return np.array([], dtype=np.int64), np.arange(len(ids)), np.random.default_rng(0)
+    return np.flatnonzero(of == int(fold)), np.flatnonzero(of != int(fold)), np.random.default_rng(0)
+
+
+def epoch_set(spec: str) -> set[int]:
+    """'12:32' -> epochs 12..32; '14:32:2' -> every second one."""
+    if not spec:
+        return set()
+    a, b, *s = (int(v) for v in spec.split(":"))
+    return set(range(a, b + 1, s[0] if s else 1))
+
+
+PHOTOS = OUT / "train_photos256.npz"
+
+
+def photo_pack() -> None:
+    """The training photos resized to 256 px exactly as image_tensor does, as one uint8 array (train --finetune)."""
+    paths = rows("train")
+    ids = np.load(OUT / "train.npz", allow_pickle=False)["ids"]
+    if ids.tolist() != [p.parent.name for p in paths]:
+        raise SystemExit("train.npz does not match the training images")
+    size = ENCODERS["dinov3l"]
+    imgs = np.stack([np.asarray(Image.open(p).convert("RGB").resize((size, size), Image.BICUBIC)) for p in paths])
+    np.savez(PHOTOS, ids=ids, imgs=imgs)
+    print(f"packed {imgs.shape} -> {PHOTOS}")
+
+
+def plain_pixels(img: np.ndarray) -> torch.Tensor:
+    x = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+    return (x - torch.tensor(MEAN)[:, None, None]) / torch.tensor(STD)[:, None, None]
+
+
+class Tuner(nn.Module):
+    """DINOv3-L/16 whose last `n` blocks and final norm train with the decoder; the rest stays frozen.
+
+    Kept in eval mode (DINOv3 has no dropout to switch). bf16 where the GPU has it: DINOv3 gives NaN in fp16,
+    so older GPUs run it in fp32.
+    """
+
+    def __init__(self, n: int) -> None:
+        super().__init__()
+        self.enc = DinoV3()
+        net = self.enc.net
+        blocks = net.layer if hasattr(net, "layer") else net.model.layer  # older / newer transformers
+        self.enc.requires_grad_(False)
+        for blk in list(blocks)[-n:]:
+            blk.requires_grad_(True)
+        net.norm.requires_grad_(True)
+        self.n = n
+        self.eval()
+
+    def train(self, mode: bool = True) -> "Tuner":
+        return super().train(False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        bf16 = x.is_cuda and torch.cuda.get_device_capability(x.device)[0] >= 8
+        with torch.autocast(x.device.type, dtype=torch.bfloat16, enabled=bf16):
+            return self.enc(x).float()
+
+    def tuned(self) -> dict[str, torch.Tensor]:
+        return {k: v for k, v in self.named_parameters() if v.requires_grad}
+
+    def load_tuned(self, state: dict[str, torch.Tensor]) -> None:
+        own = self.tuned()
+        if set(own) != set(state):
+            raise SystemExit("the checkpoint's encoder blocks do not match this Tuner")
+        with torch.no_grad():
+            for k, v in state.items():
+                own[k].copy_(v)
+
+
+def tuned_encoder(blob: dict, dev: torch.device) -> Tuner | None:
+    """The fine-tuned encoder a checkpoint needs (train --finetune), or None for cached-token checkpoints."""
+    if not blob.get("finetune"):
+        return None
+    tuner = Tuner(blob["finetune"]).to(dev)
+    tuner.load_tuned(blob["enc_state"])
+    return tuner
+
+
 def radii(pts: torch.Tensor) -> torch.Tensor:
     return pts.square().sum(-1).mean(-1).sqrt()
 
@@ -859,7 +956,7 @@ def right_handed(pts: np.ndarray, ids: list[str]) -> np.ndarray:
     return out
 
 
-def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False, drop_path: float = 0.0, attn_drop: float = 0.0, grid_jitter: float = 0.0, repulse: float = 0.0, ema: float = 0.0, deep_sup: float = 0.0, flip_aug: bool = False, size_hint: bool = False, cat_drop: float = 0.0, sides: tuple[float, float] = (1.0, 1.0), pos: bool = False, right: bool = False, aug_sets: int = 0, size_head: float = 0.0, swd: float = 0.0, l1cd: bool = False, feat_noise: float = 0.0, no_cat: bool = False, extra_enc: str = "") -> None:
+def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int = 0, drop_oversized: bool = False, flips: bool = True, fourier: int = 0, resample: bool = False, token_drop: float = 0.0, all_queries: bool = False, reweight_oversized: bool = False, drop_path: float = 0.0, attn_drop: float = 0.0, grid_jitter: float = 0.0, repulse: float = 0.0, ema: float = 0.0, deep_sup: float = 0.0, flip_aug: bool = False, size_hint: bool = False, cat_drop: float = 0.0, sides: tuple[float, float] = (1.0, 1.0), pos: bool = False, right: bool = False, aug_sets: int = 0, size_head: float = 0.0, swd: float = 0.0, l1cd: bool = False, feat_noise: float = 0.0, no_cat: bool = False, extra_enc: str = "", folds: Path | None = None, fold: str = "", save_epochs: str = "", finetune: int = 0, ft_lr: float = 1e-5) -> None:
     """target unit: shape only, size from scale.py. target mm: shape and size end to end.
 
     On the 10% holdout the end-to-end model beat every unit shape x predicted size
@@ -891,7 +988,19 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
     unit_mm = 40.0 if target == "mm" and arch != "atlas" else 1.0
     unit = pts / r[:, None, None] if target == "unit" else pts / unit_mm
     cat = torch.tensor([vocab[c] for c in z["cats"].tolist()], dtype=torch.long)
-    val, tr, rng = holdout(len(feats))
+    val, tr, rng = split(z["ids"].tolist(), folds, fold)
+    if (folds is None) != (not fold):
+        raise SystemExit("--folds and --fold go together")
+    if folds is not None:
+        print(f"fold {fold} of {folds.name}: train {len(tr)}, check {len(val)}")
+    photos, tuner = None, None
+    if finetune:  # the encoder's last blocks train too, so tokens come from the photos every step
+        if enc != "dinov3l" or extra_enc or flip_aug or aug_sets or feat_noise or token_drop or size_hint or resample:
+            raise SystemExit("--finetune needs --encoder dinov3l and none of --extra, --flip-aug, --aug-sets, --feat-noise, --token-drop, --size-hint, --resample")
+        with np.load(PHOTOS, allow_pickle=False) as pz:
+            if pz["ids"].tolist() != z["ids"].tolist():
+                raise SystemExit(f"{PHOTOS} does not match train.npz. Run: uv run baselines/atlas.py photos")
+            photos = pz["imgs"]
     if seed:  # same holdout, different initialisation and data order: an ensemble member
         rng = np.random.default_rng(1000 + seed)
         torch.manual_seed(seed)
@@ -959,10 +1068,17 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         for i, blk in enumerate(net.blocks):  # stochastic depth rises from 0 at the first block
             blk.attn_drop, blk.drop_path = attn_drop, drop_path * i / (len(net.blocks) - 1)
     lr = 1e-3 if arch == "atlas" else 3e-4
-    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
+    groups = [{"params": list(net.parameters()), "lr": lr}]
+    if finetune:
+        if arch == "atlas":
+            raise SystemExit("--finetune needs a block decoder")
+        tuner = Tuner(finetune).to(dev)
+        groups.append({"params": list(tuner.tuned().values()), "lr": ft_lr})
+        print(f"finetune: last {finetune} DINOv3 blocks + norm, {sum(p.numel() for p in tuner.tuned().values()) / 1e6:.1f}M parameters at lr {ft_lr:g}")
+    opt = torch.optim.AdamW(groups, lr=lr, weight_decay=1e-4)
     scaler = torch.amp.GradScaler(enabled=dev.type == "cuda" and half_dtype(dev) == torch.float16)  # fp16 needs loss scaling; bf16 does not
     steps = epochs * -(-len(tr) // (4 if dev.type == "cuda" else 2))
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=steps, pct_start=0.05) if arch != "atlas" else None
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, [g["lr"] for g in groups], total_steps=steps, pct_start=0.05) if arch != "atlas" else None
     batch = 4 if dev.type == "cuda" else 2
     best, best_score = None, float("inf")
     shadow, ema_best, ema_score, ema_step = None, None, float("inf"), 0
@@ -978,18 +1094,34 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
             shadow.add_scale(feats.shape[-1], cat_logr, unit_mm)
         shadow = shadow.to(dev).eval()
         shadow.load_state_dict(net.state_dict())
+    enc_shadow = {k: v.detach().clone() for k, v in tuner.tuned().items()} if tuner is not None and shadow is not None else None
+    blob = {"vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier, "hint_bank": hint_bank, "pos": pos, "tokens": feats.shape[1], "size_head": size_head, "n_vocab": len(vocab), "no_cat": no_cat, "extra": extra_enc, "finetune": finetune, "folds": folds.name if folds else "", "fold": fold}
+    saves = epoch_set(save_epochs)
+    best_enc, ema_best_enc = None, None
 
-    def check(model: nn.Module) -> float:
+    def cpu(state: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return {k: v.detach().cpu().clone() for k, v in state.items()}
+
+    def check(model: nn.Module, enc_state: dict[str, torch.Tensor] | None = None) -> float:
+        if not len(val):  # --fold all: nothing held out
+            return float("nan")
+        kept = None
+        if tuner is not None and enc_state is not None:  # score with the averaged encoder blocks, then put the live ones back
+            kept = {k: v.detach().clone() for k, v in tuner.tuned().items()}
+            tuner.load_tuned(enc_state)
         vtotal, vseen = 0.0, 0
         with torch.inference_mode():
             for i in range(0, len(val), batch):
                 b = val[i : i + batch]
-                pred = model(feats[b].to(dev), cat[b].to(dev), **({"hint": hints[b].to(dev)} if hints is not None else {}))
+                tok = feats[b].to(dev) if tuner is None else tuner(torch.stack([plain_pixels(photos[k]) for k in b]).to(dev))
+                pred = model(tok, cat[b].to(dev), **({"hint": hints[b].to(dev)} if hints is not None else {}))
                 # shape error in mm^2 at the true size: CD scales with r^2
                 for j, k in enumerate(b):
                     gain = float(r[k]) ** 2 if target == "unit" else unit_mm**2
                     vtotal += float(chamfer(pred[j : j + 1], unit[k : k + 1].to(dev), flips=flips)) * gain
                 vseen += len(b)
+        if kept is not None:
+            tuner.load_tuned(kept)
         return vtotal / vseen
 
     for epoch in range(1, epochs + 1):
@@ -1003,7 +1135,10 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
         seen = 0
         for i in range(0, len(tr), batch):
             b = tr[i : i + batch]
-            tok = src[b]
+            if tuner is not None:  # a fresh augmented view of each photo through the partly trainable encoder
+                tok = tuner(torch.stack([augment_pil(Image.fromarray(photos[k]), ENCODERS[enc], rng) for k in b]).to(dev))
+            else:
+                tok = src[b]
             if feat_noise:  # Gaussian noise on the frozen tokens, scaled per token
                 tok = tok + feat_noise * tok.std(-1, keepdim=True) * torch.randn_like(tok)
             if flipped is not None:  # the mirrored image has the same canonical target (geom.canonicalize fixes signs by skewness)
@@ -1045,28 +1180,41 @@ def train(ckpt: Path, epochs: int, arch: str, enc: str, target: str, seed: int =
                 with torch.no_grad():
                     for s, v in zip(shadow.state_dict().values(), net.state_dict().values()):
                         s.lerp_(v, 1 - d) if s.is_floating_point() else s.copy_(v)
+                    if enc_shadow is not None:
+                        for k, v in tuner.tuned().items():
+                            enc_shadow[k].lerp_(v.detach(), 1 - d)
             total += float(loss.detach()) * len(b)
             seen += len(b)
         net.eval()
         score = check(net)
         if score < best_score:
             best_score = score
-            best = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+            best = cpu(net.state_dict())
+            best_enc = cpu(tuner.tuned()) if tuner is not None else None
         note = ""
         if shadow is not None:
-            now = check(shadow)
+            now = check(shadow, enc_shadow)
             note = f"  ema {now:.1f}"
             if now < ema_score:
                 ema_score = now
-                ema_best = {k: v.detach().cpu().clone() for k, v in shadow.state_dict().items()}
+                ema_best = cpu(shadow.state_dict())
+                ema_best_enc = cpu(enc_shadow) if enc_shadow is not None else None
+        if epoch in saves:  # fixed-epoch snapshots of the averaged weights (the raw ones without --ema)
+            snap = ckpt.with_name(f"{ckpt.stem}_{'ema_' if shadow is not None else ''}e{epoch}.pt")
+            enc_now = enc_shadow if shadow is not None else (tuner.tuned() if tuner is not None else None)
+            snap.parent.mkdir(parents=True, exist_ok=True)
+            torch.save({"state": cpu((shadow if shadow is not None else net).state_dict()), **blob, "epoch": epoch, **({"enc_state": cpu(enc_now)} if enc_now is not None else {})}, snap)
         print(f"epoch {epoch}  train {total / seen * (unit_mm**2 if target == 'mm' else 1):.4f}  holdout {score:.1f} mm^2" + (" at true size" if target == "unit" else "") + note, flush=True)
     ckpt.parent.mkdir(parents=True, exist_ok=True)
-    blob = {"vocab": vocab, "dim": feats.shape[-1], "unit": target == "unit", "arch": arch, "encoder": enc, "unit_mm": unit_mm, "fourier": fourier, "hint_bank": hint_bank, "pos": pos, "tokens": feats.shape[1], "size_head": size_head, "n_vocab": len(vocab), "no_cat": no_cat, "extra": extra_enc}
-    torch.save({"state": best, **blob}, ckpt)
+    if best is None:  # nothing held out (--fold all): the final weights
+        best, best_enc = cpu(net.state_dict()), (cpu(tuner.tuned()) if tuner is not None else None)
+        if shadow is not None:
+            ema_best, ema_best_enc = cpu(shadow.state_dict()), (cpu(enc_shadow) if enc_shadow is not None else None)
+    torch.save({"state": best, **blob, **({"enc_state": best_enc} if best_enc is not None else {})}, ckpt)
     print(f"saved {ckpt}  holdout {best_score:.1f}")
     if shadow is not None:
         path = ckpt.with_name(f"{ckpt.stem}_ema.pt")
-        torch.save({"state": ema_best, **blob}, path)
+        torch.save({"state": ema_best, **blob, **({"enc_state": ema_best_enc} if ema_best_enc is not None else {})}, path)
         print(f"saved {path}  holdout {ema_score:.1f}")
 
 
@@ -1379,7 +1527,7 @@ def fit_check() -> None:
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "augcache", "dense", "flipcache", "train", "predict", "evaluate", "check"])
+    ap.add_argument("cmd", nargs="?", default="train", choices=["cache", "augcache", "dense", "flipcache", "photos", "train", "predict", "evaluate", "check"])
     ap.add_argument("--ckpt", type=Path, nargs="+", default=[CKPT])
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--arch", choices=sorted(ARCHS), default="deep", help="train: decoder (atlas = the original)")
@@ -1413,6 +1561,11 @@ if __name__ == "__main__":
     ap.add_argument("--cat-drop", type=float, default=0.0, help="train: share of objects whose category is replaced by an unknown token")
     ap.add_argument("--stray-weight", type=float, default=1.0, help="train: weight of the predicted-to-true half of the loss")
     ap.add_argument("--miss-weight", type=float, default=1.0, help="train: weight of the true-to-predicted half of the loss")
+    ap.add_argument("--folds", type=Path, default=None, help="train: fold file from baselines/tools/make_folds.py (needs --fold); default the fixed 10%% holdout")
+    ap.add_argument("--fold", default="", help="train: fold to hold out (0..4), or 'all' to train on every object")
+    ap.add_argument("--save-epochs", default="", help="train: also save the EMA weights at these epochs, 'A:B' or 'A:B:step', as <ckpt>_ema_e<E>.pt")
+    ap.add_argument("--finetune", type=int, default=0, help="train: also train the last N DINOv3 blocks, reading augmented photos (run: photos)")
+    ap.add_argument("--ft-lr", type=float, default=1e-5, help="train: peak learning rate of the fine-tuned DINOv3 blocks")
     ap.add_argument("--shape", choices=["decoder", "retrieve"], default="decoder", help="predict: decoder or nearest training shape")
     ap.add_argument("--retrieval", action="store_true", help="evaluate: also score the nearest-training-shape baseline")
     args = ap.parse_args()
@@ -1422,10 +1575,12 @@ if __name__ == "__main__":
         cache_dense()
     elif args.cmd == "flipcache":
         cache_flip(args.encoder)
+    elif args.cmd == "photos":
+        photo_pack()
     elif args.cmd == "augcache":
         augcache(args.encoder, args.aug_sets, args.seed)
     elif args.cmd == "train":
-        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized, args.drop_path, args.attn_drop, args.grid_jitter, args.repulsion, args.ema, args.deep_sup, args.flip_aug, args.size_hint, args.cat_drop, (args.stray_weight, args.miss_weight), args.pos_emb, args.right_handed, args.aug_sets, args.size_head, args.swd, args.l1cd, args.feat_noise, args.no_cat, args.extra)
+        train(args.ckpt[0], args.epochs, args.arch, args.encoder, args.target, args.seed, args.drop_oversized, not args.no_flip_loss, args.fourier, args.resample, args.token_drop, args.all_queries, args.reweight_oversized, args.drop_path, args.attn_drop, args.grid_jitter, args.repulsion, args.ema, args.deep_sup, args.flip_aug, args.size_hint, args.cat_drop, (args.stray_weight, args.miss_weight), args.pos_emb, args.right_handed, args.aug_sets, args.size_head, args.swd, args.l1cd, args.feat_noise, args.no_cat, args.extra, args.folds, args.fold, args.save_epochs, args.finetune, args.ft_lr)
     elif args.cmd == "predict":
         if len(args.ckpt) > 1:
             predict_ensemble(args.ckpt)

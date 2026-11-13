@@ -27,6 +27,9 @@ for f in ("atlas.py", "geom.py"):
     shutil.copy(code / f, root / "baselines" / f)
 shutil.copy(code / "score2.py", q / "score2.py")
 shutil.copy(code / "pl_t_s0_ema.pt", atlas / "pl_t_s0_ema.pt")
+(root / "baselines" / "folds").mkdir(exist_ok=True)
+for f in code.glob("*.csv"):  # fold files: flags refer to them as baselines/folds/<name>
+    shutil.copy(f, root / "baselines" / "folds" / f.name)
 for f in (f for d in datas for f in d.glob("*.npz")):
     if not (atlas / f.name).exists():
         os.symlink(f, atlas / f.name)
@@ -55,6 +58,13 @@ while procs:
         print(time.strftime("%H:%M"), "END", name, "rc", p.returncode, flush=True)
         if p.returncode != 0:
             summary.write(f"FAILED {name} rc {p.returncode}\n"); summary.flush()
+            continue
+        for snap in atlas.glob(f"{name}_*e[0-9]*.pt"):  # --save-epochs snapshots
+            shutil.copy(snap, out / snap.name)
+        if "--fold" in flags.split():  # score2 scores the old holdout, which fold runs have trained on
+            for n in (name, name + "_ema"):
+                shutil.copy(atlas / f"{n}.pt", out / f"{n}.pt")
+            summary.write(f"{name} done (fold run, scored by tools/oof.py)\n"); summary.flush()
             continue
         for n in (name, name + "_ema"):
             shutil.copy(atlas / f"{n}.pt", out / f"{n}.pt")
