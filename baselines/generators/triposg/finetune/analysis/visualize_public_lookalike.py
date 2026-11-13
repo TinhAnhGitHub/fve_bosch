@@ -34,6 +34,7 @@ GROUPS = [("agree", "agree: the two look-alike radii are within 6% of each other
           ("differ", "disagree: more than 19% apart", "bad"),
           ("one only", "only one look-alike in the training set (a rare food type)", "bad")]
 LEADERBOARD_BEST, RATIO = 43.85, 1.5
+LEADERBOARD_THIS = 102.82  # this recipe's zip (v36_lora_lookalike_size), uploaded by the user on 2026-11-13 09:27 Vietnam time
 EXTRA_CSS = ".ok{background:#dff3df}.mid{background:#fdeccf}.bad{background:#fbd5d0}.grp{padding:1px 6px;font-weight:bold}"
 
 
@@ -107,7 +108,7 @@ def draw_groups(path, stats, overall, counts):
     ax.bar(range(3), [s["mean"] for s in stats], color=colors)
     for i, s in enumerate(stats):
         ax.text(i, s["mean"] + 2, f"mean {s['mean']:.0f}\nmedian {s['median']:.0f}", ha="center", fontsize=9)
-    ax.axhline(24.2, ls="-.", color="#4c9f4c", lw=1, label="24.2: LoRA at the true size (the floor)")
+    ax.axhline(24.2, ls="-.", color="#4c9f4c", lw=1, label="24.2: LoRA at the true size (its best case)")
     ax.axhline(LEADERBOARD_BEST / RATIO, ls=":", color="k", lw=1.3, label=f"about {LEADERBOARD_BEST / RATIO:.0f}: RH-Mix5 on this holdout (estimate)")
     ax.set_xticks(range(3))
     ax.set_xticklabels(["look-alikes\nagree", "partly\nagree", "look-alikes\ndisagree"])
@@ -172,12 +173,12 @@ object carries the score that holdout objects with the same agreement had. It is
 <th style="cursor:default">Public test photos</th></tr>
 {group_rows}
 </table>
-<p><b>What to expect overall.</b> On the holdout this recipe scored a mean of {overall:.1f} (median {median:.1f}); the size head's own sizes scored 79.3,
-the true size 24.2. Our best submission, RH-Mix5, scored {LEADERBOARD_BEST} on the leaderboard, and leaderboard scores have run 1.3 to 1.7 times holdout
-scores for our other models, so RH-Mix5 would be about {local:.0f} on this holdout. The ratio for this pipeline is unknown; if the usual one holds, this file
-would score roughly 80 to 100 on the leaderboard. The two thirds of the objects where the look-alikes agree or partly agree score a median of about
-19 to 20 (mean 32 to 38); the third where they disagree has a mean of 106 and carries most of the loss. <b>This is why the zip is built but not
-recommended for upload.</b></p>
+<p><b>How good is it? Worse than our best everywhere.</b> On the holdout this recipe scored a mean of {overall:.1f} (median {median:.1f}); the size head's own sizes scored 79.3,
+and the true size 24.2, which is the LoRA's best case and not a result. Our best submission, RH-Mix5, scored {LEADERBOARD_BEST} on the leaderboard, and leaderboard scores have run 1.3 to 1.7 times holdout
+scores, so RH-Mix5 is about {local:.0f} on this holdout. <b>This file was uploaded on 2026-11-13 and scored {LEADERBOARD_THIS} on the leaderboard</b>, 1.69 times its holdout mean.
+Even the better two thirds of the objects (the look-alikes agree or partly agree: median about 19 to 20, mean 32 to 38) average above RH-Mix5's {local:.0f};
+the third where they disagree has a mean of 106 and carries most of the loss. Nothing on this page is close to our best submission. The bands below only say
+where the LoRA is least bad.</p>
 <p>Median size {statistics.median(sizes):.1f} mm, smallest {min(sizes):.1f}, largest {max(sizes):.1f}.
 <b>To find one object:</b> use the browser's find box (Ctrl+F) with its full id (written <code>omni_&lt;food&gt;_&lt;number&gt;</code> or
 <code>mf3d_&lt;food&gt;_&lt;number&gt;</code>). The first match is its row in the table; press Enter once more to land on its heading and image further down.

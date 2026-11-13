@@ -2,7 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = ["numpy", "pillow", "torch", "transformers", "trimesh"]
 # ///
-"""Handedness-aware point-mix ensembles. usage: ens.py root holdout|eval
+"""Handedness-aware point-mix ensembles. usage: ens.py root holdout|eval|holdout_save
 
 Each member's cloud is aligned to the reference member (the first one, right-handed) per
 object: the best of the 8 axis sign flips (mirrors included), then rigid ICP; then the
@@ -118,6 +118,25 @@ if mode == "holdout":
             s.append(strict(torch.tensor(mix([p.cpu().numpy() for p in parts])).to(dev), gt[i].to(dev)))
         s = np.array(s)
         print(f"{plan:18s} {s.mean():6.2f} median {np.median(s):5.1f}  ({'+'.join(mem)})", flush=True)
+elif mode == "holdout_save":
+    # ens.py root holdout_save OUT.npz [plan]: the plan's mixed clouds for the 204 holdout objects (default RH-Mix5), built exactly as
+    # in `holdout` and `eval`, saved with the strict score of each object, so they can be scored and combined with other clouds.
+    out_path, plan = Path(sys.argv[3]), (sys.argv[4] if len(sys.argv) > 4 else "e5_v22plus_rh2")
+    mem = PLANS[plan]
+    z, _ = _load_cache("dinov3l")
+    val, _, _ = holdout(len(z["ids"]))
+    gt = torch.tensor(right_handed(z["pts"][val], z["ids"][val].tolist()), dtype=torch.float32)
+    feats = torch.tensor(z["feats"][val], dtype=torch.float32)
+    C = member_clouds(sorted(set(mem), key=list(CK).index), lambda enc: feats, z["cats"][val].tolist(), len(val))
+    clouds, scores = [], []
+    for i in range(len(val)):
+        ref = C[mem[0]][i].to(dev)
+        parts = [ref] + [align_to(C[m][i].to(dev), ref) for m in mem[1:]]
+        cloud = mix([p.cpu().numpy() for p in parts])
+        clouds.append(cloud)
+        scores.append(strict(torch.tensor(cloud).to(dev), gt[i].to(dev)))
+    np.savez(out_path, ids=z["ids"][val], pts=np.stack(clouds).astype(np.float32), strict=np.array(scores))
+    print(f"{plan}: strict mean {np.mean(scores):.2f} median {np.median(scores):.1f} over {len(val)} objects -> {out_path}", flush=True)
 else:
     paths = rows("val")
     enc = encoder(dev, "dinov3l")

@@ -20,6 +20,7 @@ Run with:  uv run --no-project --with numpy --with scipy --with trimesh python -
   holdout FEATURE_DIR METADATA OUT_DIR LORA_VAL_NPZ   guesses for the 204 holdout objects (pool = train) -> OUT_DIR/holdout_sizes.npz
   twins   DATA_DIR FEATURE_DIR METADATA OUT_DIR       is the holdout as close to the pool as the public photos are to all 2,042?
   score   DATA_DIR METADATA OUT_DIR LORA_VAL_NPZ [ARM ...]   CD of the LoRA shape at each guess (rotation + translation only)
+  score_file DATA_DIR METADATA OUT_DIR NPZ NAME       CD of any clouds (ids, pts in mm) on the holdout -> OUT_DIR/cd_<NAME>.npz
   table    OUT_DIR HOLDOUT_DIR                        add the look-alike score to the holdout page (lora_vs_truth/index_lookalike.csv)
   public  DATA_DIR FEATURE_DIR METADATA OUT_DIR LORA_EVAL_NPZ  guesses for the 511 public photos (pool = all 2,042) + npz + zip
   neighbours DATA_DIR FEATURE_DIR METADATA OUT_DIR LORA_EVAL_NPZ  the look-alikes behind each public guess -> OUT_DIR/public_neighbours.csv
@@ -419,6 +420,25 @@ def score_job(job):
     return [scorer(place(unit_cloud, radius), truth) for radius in radii]
 
 
+def score_cloud_job(job):
+    data, row, unit_mm, cloud = job
+    return aligned_cd()(cloud, sample_truth((data, row, unit_mm)))
+
+
+def cmd_score_file(data, metadata, out, npz, name):
+    """CD-L2 of the clouds in NPZ (arrays ids and pts, taken as they are, in mm) with the same scorer and truth sampling as `score`
+    -> OUT_DIR/cd_<name>.npz. Used for clouds that do not come from the LoRA, for example RH-Mix5's."""
+    rows, unit_mm = read_metadata(metadata)
+    by_id = {r["id"]: r for r in rows}
+    with np.load(npz, allow_pickle=False) as z:
+        ids, pts = z["ids"].tolist(), z["pts"].astype(np.float64)
+    jobs = [(data, by_id[i], unit_mm, pts[n]) for n, i in enumerate(ids)]
+    with ProcessPoolExecutor(14) as pool:
+        scores = np.array(list(pool.map(score_cloud_job, jobs, chunksize=1)))
+    np.savez(Path(out) / f"cd_{name}.npz", ids=np.array(ids), cd=scores)
+    print(f"{name}: CD-L2 mean {scores.mean():.2f} median {np.median(scores):.2f} over {len(ids)} objects", flush=True)
+
+
 def cmd_score(data, metadata, out, lora_val, arms):
     rows, unit_mm = read_metadata(metadata)
     by_id = {r["id"]: r for r in rows}
@@ -541,6 +561,8 @@ def main():
         cmd_twins(*args)
     elif command == "score":
         cmd_score(*args[:4], args[4:])
+    elif command == "score_file":
+        cmd_score_file(*args)
     elif command == "public":
         cmd_public(*args)
     else:
