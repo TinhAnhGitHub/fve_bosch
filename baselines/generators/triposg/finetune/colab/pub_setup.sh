@@ -35,7 +35,7 @@ fi
 apt-get install -y -qq --no-install-recommends cuda-nvcc-12-6 cuda-cudart-dev-12-6 cuda-cccl-12-6 cuda-nvrtc-dev-12-6 \
   cuda-nvtx-12-6 cuda-profiler-api-12-6 libcublas-dev-12-6 libcusparse-dev-12-6 libcusolver-dev-12-6 libcurand-dev-12-6 \
   > /tmp/apt.log 2>&1 || { tail -5 /tmp/apt.log; echo "apt failed"; false; }
-export CUDA_HOME=/usr/local/cuda-12.6 PATH=/usr/local/cuda-12.6/bin:$PATH TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=8
+export CUDA_HOME=/usr/local/cuda-12.6 PATH=/usr/local/cuda-12.6/bin:$PATH TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-8.9} MAX_JOBS=8  # 8.9 L4, 8.0 A100
 nvcc --version | tail -1
 $uvp setuptools wheel ninja
 uv pip install --python $PY --no-build-isolation diso 2>&1 | tail -3
