@@ -6,7 +6,8 @@
 
 usage:
   oof.py curve LOGDIR NAME                 per-epoch EMA check of NAME_f0..f4 (train logs), mean curve, E* = its argmin
-  oof.py predict CKDIR NAME EPOCH OUT.npz  OOF clouds: fold k's objects from NAME_fk_ema_e<EPOCH>.pt, strict scores
+  oof.py predict CKDIR NAME EPOCH OUT.npz [SUFFIX]  OOF clouds: fold k's objects from NAME_fk_ema_e<EPOCH><SUFFIX>.pt
+                                           (SUFFIX _h = encoder blocks stored in fp16), strict scores
 
 E* is one epoch per recipe, chosen on the mean curve of all folds, never a per-fold best, so the OOF score is not
 picked on the objects it reports. Fine-tuned checkpoints (train --finetune) compute tokens with their own encoder
@@ -45,7 +46,7 @@ def curve(logdir: Path, name: str) -> int:
     return best
 
 
-def predict(ckdir: Path, name: str, epoch: int, out: Path) -> None:
+def predict(ckdir: Path, name: str, epoch: int, out: Path, suffix: str = "") -> None:
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     z, _ = _load_cache("dinov3l")
     ids = z["ids"].tolist()
@@ -57,7 +58,7 @@ def predict(ckdir: Path, name: str, epoch: int, out: Path) -> None:
     for k in range(K):
         val, _, _ = split(ids, FOLDS, str(k))
         fold_of[val] = k
-        net, blob = load_net(ckdir / f"{name}_f{k}_ema_e{epoch}.pt", dev)
+        net, blob = load_net(ckdir / f"{name}_f{k}_ema_e{epoch}{suffix}.pt", dev)
         if blob.get("fold") != str(k):
             raise SystemExit(f"{name}_f{k} was trained with fold {blob.get('fold')!r}")
         tuner = tuned_encoder(blob, dev)
@@ -117,7 +118,7 @@ if __name__ == "__main__":
     if cmd == "curve":
         curve(Path(sys.argv[2]), sys.argv[3])
     elif cmd == "predict":
-        predict(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), Path(sys.argv[5]))
+        predict(Path(sys.argv[2]), sys.argv[3], int(sys.argv[4]), Path(sys.argv[5]), sys.argv[6] if len(sys.argv) > 6 else "")
     elif cmd == "report":
         report(Path(sys.argv[2]))
     else:
