@@ -22,6 +22,7 @@ Run with:  uv run --no-project --with numpy --with scipy --with trimesh python -
   score   DATA_DIR METADATA OUT_DIR LORA_VAL_NPZ [ARM ...]   CD of the LoRA shape at each guess (rotation + translation only)
   table    OUT_DIR HOLDOUT_DIR                        add the look-alike score to the holdout page (lora_vs_truth/index_lookalike.csv)
   public  DATA_DIR FEATURE_DIR METADATA OUT_DIR LORA_EVAL_NPZ  guesses for the 511 public photos (pool = all 2,042) + npz + zip
+  neighbours DATA_DIR FEATURE_DIR METADATA OUT_DIR LORA_EVAL_NPZ  the look-alikes behind each public guess -> OUT_DIR/public_neighbours.csv
 """
 import ast
 import csv
@@ -140,9 +141,10 @@ def category_median(q_cat, pool_cat, pool_lnr, forbid=None):
     return out
 
 
-def look_alikes(sim, q_cat, pool_cat, pool_lnr, k=K, forbid=None):
+def look_alikes(sim, q_cat, pool_cat, pool_lnr, k=K, forbid=None, record=None):
     """The k most similar pool objects of the same food type (any food type when it has none). Returns the similarity-weighted mean
-    log radius, the best similarity, and the log-radius gap between the two closest (NaN with one neighbour)."""
+    log radius, the best similarity, and the log-radius gap between the two closest (NaN with one neighbour). A list passed as
+    `record` receives each query's neighbour indices into the pool, closest first."""
     by_cat = {c: np.flatnonzero(pool_cat == c) for c in np.unique(pool_cat)}
     guess, best, gap, fallback = np.empty(len(q_cat)), np.empty(len(q_cat)), np.full(len(q_cat), np.nan), 0
     for i, c in enumerate(q_cat):
@@ -153,6 +155,8 @@ def look_alikes(sim, q_cat, pool_cat, pool_lnr, k=K, forbid=None):
             fallback += 1
             cand = np.flatnonzero(~forbid[i]) if forbid is not None else np.arange(len(pool_cat))
         near = cand[np.argsort(-sim[i, cand])][:k]
+        if record is not None:
+            record.append(near)
         weight = np.clip(sim[i, near], 1e-3, None)
         guess[i] = (weight * pool_lnr[near]).sum() / weight.sum()
         best[i] = sim[i, near[0]]
@@ -327,12 +331,16 @@ def guesses(config, feature_dir, pool_rows, pool_r, query_rows, query_prefix):
     cat_pool = np.array([r["category"] for r in pool_rows])
     cat_query = np.array([r["category"] for r in query_rows])
     lnr = np.log(pool_r)
-    knn, best, gap, fallback = look_alikes(a_query @ a_pool.T, cat_query, cat_pool, lnr)
+    record = []
+    sim = a_query @ a_pool.T
+    knn, best, gap, fallback = look_alikes(sim, cat_query, cat_pool, lnr, record=record)
     cat = category_median(cat_query, cat_pool, lnr)
     formula = ridge_formula(a_pool, cat_pool, lnr, a_query, cat_query, (config["alpha"],))[0]
     weights = config["weights"]
+    neighbours = np.array([list(near) + [-1] * (K - len(near)) for near in record])
     return dict(cat_median=np.exp(cat), knn=np.exp(knn), ridge=np.exp(formula), blend=mix(weights, (cat, knn, formula)),
-                best_similarity=best, neighbour_gap=gap), fallback
+                best_similarity=best, neighbour_gap=gap, neighbours=neighbours,
+                neighbour_similarity=np.where(neighbours >= 0, np.take_along_axis(sim, np.maximum(neighbours, 0), 1), np.nan)), fallback
 
 
 def cmd_holdout(feature_dir, metadata, out, lora_val):
@@ -453,6 +461,38 @@ def cmd_table(out, holdout):
     print(f"wrote {path}: look-alike size CD mean {column.mean():.2f}, median {np.median(column):.2f}")
 
 
+def cmd_neighbours(data, feature_dir, metadata, out, lora_eval):
+    """The look-alikes behind each public photo's size guess -> OUT_DIR/public_neighbours.csv (read by visualize_public_lookalike.py).
+    Recomputes the guesses and checks that they equal the radii already in public_lora_lookalike.npz."""
+    rows, _ = read_metadata(metadata)
+    config = json.loads((Path(out) / "config.json").read_text())
+    pool_rows, pool_r = load_pool(out, rows, ("train", "val"))
+    queries = eval_rows(data)
+    sizes, _ = guesses(config, feature_dir, pool_rows, pool_r, queries, PUBLIC_FEATURE_KEY)
+    with np.load(Path(out) / "public_lora_lookalike.npz", allow_pickle=False) as z:
+        built = dict(zip(z["ids"].tolist(), z["radius_mm"].tolist()))
+    if not np.allclose([built[q["id"]] for q in queries], sizes["blend"], rtol=1e-5):
+        raise ValueError("the recomputed guesses differ from public_lora_lookalike.npz")
+    with np.load(lora_eval, allow_pickle=False) as z:
+        head = dict(zip(z["ids"].tolist(), z["radius_mm"].tolist()))
+    columns = ["id", "category", "head_radius_mm", "lookalike_radius_mm", "formula_radius_mm", "final_radius_mm", "best_similarity",
+               "neighbour_gap"]
+    for n in (1, 2):
+        columns += [f"nn{n}_id", f"nn{n}_similarity", f"nn{n}_radius_mm"]
+    with open(Path(out) / "public_neighbours.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(columns)
+        for i, q in enumerate(queries):
+            line = [q["id"], q["category"], f"{head[q['id']]:.2f}", f"{sizes['knn'][i]:.2f}", f"{sizes['ridge'][i]:.2f}",
+                    f"{sizes['blend'][i]:.2f}", f"{sizes['best_similarity'][i]:.4f}",
+                    "" if np.isnan(sizes["neighbour_gap"][i]) else f"{sizes['neighbour_gap'][i]:.4f}"]
+            for n in range(2):
+                j = int(sizes["neighbours"][i][n])
+                line += ["", "", ""] if j < 0 else [pool_rows[j]["id"], f"{sizes['neighbour_similarity'][i][n]:.4f}", f"{pool_r[j]:.2f}"]
+            writer.writerow(line)
+    print(f"wrote {Path(out) / 'public_neighbours.csv'} for {len(queries)} public photos")
+
+
 def cmd_public(data, feature_dir, metadata, out, lora_eval):
     sys.path.insert(0, str(BASELINES))
     from geom import pack
@@ -495,6 +535,8 @@ def main():
         cmd_holdout(*args)
     elif command == "table":
         cmd_table(*args)
+    elif command == "neighbours":
+        cmd_neighbours(*args)
     elif command == "twins":
         cmd_twins(*args)
     elif command == "score":
