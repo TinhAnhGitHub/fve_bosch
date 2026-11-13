@@ -1,0 +1,8 @@
+{
+  "mode": "lora", "epochs": 20, "stop_epoch": 5, "batch_size": 1, "accumulation": 16,
+  "lr": 0.00005, "precision": "bf16", "seed": 42,
+  "gradient_checkpointing": true, "weight_decay": 0.01,
+  "warmup_fraction": 0.05, "clip_grad": 1.0, "condition_dropout": 0.1,
+  "rank": 16, "alpha": 16, "lora_dropout": 0.05,
+  "posterior_sample": true, "patience": 5, "sigma_sampling": "uniform", "hidden": 256
+}

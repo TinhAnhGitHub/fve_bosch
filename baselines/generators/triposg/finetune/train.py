@@ -38,19 +38,24 @@ class CachedObjects(Dataset):
 def read_config(path):
     config = read_json(path)
     config.setdefault("size_loss", "log_mse")
+    # stop_epoch < epochs: the learning-rate schedule spans `epochs`, training stops after `stop_epoch`
+    # (reproduces an early-stopped run's exact trajectory without a validation set)
+    config.setdefault("stop_epoch", config.get("epochs"))
     required = {"mode", "epochs", "batch_size", "accumulation", "lr", "precision",
                 "seed", "gradient_checkpointing", "weight_decay", "warmup_fraction",
                 "clip_grad", "condition_dropout", "rank", "alpha", "lora_dropout",
-                "posterior_sample", "patience", "sigma_sampling", "hidden", "size_loss"}
+                "posterior_sample", "patience", "sigma_sampling", "hidden", "size_loss", "stop_epoch"}
     if set(config) != required:
         raise ValueError(f"Config keys: missing {required - set(config)}, unknown {set(config) - required}")
     if config["mode"] not in {"lora", "full", "size"}:
         raise ValueError("mode must be lora, full, or size")
     if config["size_loss"] not in {"log_mse", "radius_mse"}:
         raise ValueError("size_loss must be log_mse or radius_mse")
-    for key in ("epochs", "batch_size", "accumulation", "rank", "alpha", "hidden", "patience"):
+    for key in ("epochs", "batch_size", "accumulation", "rank", "alpha", "hidden", "patience", "stop_epoch"):
         if not isinstance(config[key], int) or config[key] <= 0:
             raise ValueError(f"{key} must be a positive integer")
+    if config["stop_epoch"] > config["epochs"]:
+        raise ValueError("stop_epoch cannot exceed epochs")
     if config["precision"] not in {"bf16", "fp16", "fp32"} or config["sigma_sampling"] not in {"uniform", "logit_normal"}:
         raise ValueError("Invalid precision or sigma_sampling")
     for key in ("condition_dropout", "lora_dropout", "warmup_fraction"):
@@ -126,7 +131,8 @@ class FoodAdaptation(L.LightningModule):
         optimizer = torch.optim.AdamW([p for p in self.parameters() if p.requires_grad],
                     lr=self.config["lr"], weight_decay=self.config["weight_decay"],
                     betas=(0.9, 0.999), eps=1e-8, foreach=False)
-        total = max(1, int(self.trainer.estimated_stepping_batches))
+        # the trainer runs stop_epoch epochs; the schedule is laid out over all `epochs`
+        total = max(1, int(self.trainer.estimated_stepping_batches * self.config["epochs"] / self.config["stop_epoch"]))
         warmup = max(1, round(total * self.config["warmup_fraction"]))
         def factor(step):
             if step < warmup:
@@ -135,6 +141,11 @@ class FoodAdaptation(L.LightningModule):
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "step", "frequency": 1}}
+
+    def on_train_epoch_end(self):
+        # --no-val: no score picks an epoch, so every epoch's adapter is exported (epoch numbers from 0)
+        if getattr(self, "export_dir", None) is not None and not self.trainer.sanity_checking:
+            self.export(self.export_dir / f"epoch{self.current_epoch}.pt", self.current_epoch, float("nan"))
 
     def on_save_checkpoint(self, checkpoint):
         checkpoint["adaptation"] = dict(schema=SCHEMA, config=self.config,
@@ -160,6 +171,8 @@ def main():
     p.add_argument("--upstream", type=Path, required=True)
     p.add_argument("--resume", type=Path)
     p.add_argument("--memory-test", action="store_true", help="One effective batch, optimizer allocation, no checkpoints")
+    p.add_argument("--no-val", action="store_true", help="Final model on a manifest with no holdout (prepare.py manifest --all-train): "
+                   "runs exactly stop_epoch epochs, exports epoch<k>.pt after every epoch and last.pt")
     args = p.parse_args()
     config = read_config(args.config)
     if not torch.cuda.is_available():
@@ -173,9 +186,13 @@ def main():
         raise ValueError("Unsupported cache schema")
     tr = [r for r in meta["rows"] if r["split"] == "train"]
     va = [r for r in meta["rows"] if r["split"] == "val"]
-    if not tr or not va or {r["group"] for r in tr} & {r["group"] for r in va}:
+    if args.no_val:
+        if not tr or va:
+            raise ValueError("--no-val needs a cache whose rows are all training (prepare.py manifest --all-train)")
+    elif not tr or not va or {r["group"] for r in tr} & {r["group"] for r in va}:
         raise ValueError("Empty or leaking train/validation split")
-    train_data, val_data = CachedObjects(args.cache, tr), CachedObjects(args.cache, va)
+    train_data = CachedObjects(args.cache, tr)
+    val_data = CachedObjects(args.cache, va) if va else None
     first = train_data[0]
     if first["features"].shape != (257, 1024) or first["mean"].shape != (meta["tokens"], 64):
         raise ValueError("Unexpected cache tensor shapes")
@@ -205,21 +222,26 @@ def main():
                               drop_last=True, num_workers=0, pin_memory=True)
     if not len(train_loader):
         raise ValueError("Training split smaller than batch_size")
-    val_loader = DataLoader(val_data, batch_size=config["batch_size"], shuffle=False,
-                            num_workers=0, pin_memory=True)
-    saver = ModelCheckpoint(dirpath=args.output, filename="best", monitor="val_loss", mode="min",
-                            save_top_k=1, save_last=True, save_on_train_epoch_end=False)
-    callbacks = [saver, EarlyStopping(monitor="val_loss", mode="min", patience=config["patience"], check_finite=True)]
+    val_loader = None if args.no_val else DataLoader(val_data, batch_size=config["batch_size"], shuffle=False,
+                                                     num_workers=0, pin_memory=True)
+    if args.no_val:  # fixed epochs: a resumable last.ckpt plus an exported adapter per epoch, no early stopping
+        saver = ModelCheckpoint(dirpath=args.output, filename="latest", monitor=None, save_top_k=1, save_on_train_epoch_end=True)
+        callbacks = [saver]
+        task.export_dir = args.output
+    else:
+        saver = ModelCheckpoint(dirpath=args.output, filename="best", monitor="val_loss", mode="min",
+                                save_top_k=1, save_last=True, save_on_train_epoch_end=False)
+        callbacks = [saver, EarlyStopping(monitor="val_loss", mode="min", patience=config["patience"], check_finite=True)]
     precision = {"bf16": "bf16-mixed", "fp16": "16-mixed", "fp32": "32-true"}[config["precision"]]
     trainer = L.Trainer(accelerator="gpu", devices=1, precision=precision,
-                max_epochs=config["epochs"], accumulate_grad_batches=config["accumulation"],
+                max_epochs=config["stop_epoch"], accumulate_grad_batches=config["accumulation"],
                 gradient_clip_val=config["clip_grad"], gradient_clip_algorithm="norm",
                 callbacks=[] if args.memory_test else callbacks,
                 logger=False if args.memory_test else CSVLogger(args.output, name="logs"),
                 enable_checkpointing=not args.memory_test, enable_model_summary=False,
-                num_sanity_val_steps=0 if args.memory_test else 2,
+                num_sanity_val_steps=0 if args.memory_test or args.no_val else 2,
                 limit_train_batches=min(config["accumulation"], len(train_loader)) if args.memory_test else 1.0,
-                limit_val_batches=0 if args.memory_test else 1.0,
+                limit_val_batches=0 if args.memory_test or args.no_val else 1.0,
                 max_steps=1 if args.memory_test else -1, log_every_n_steps=1,
                 deterministic="warn")
     torch.cuda.reset_peak_memory_stats()
@@ -227,7 +249,9 @@ def main():
                 ckpt_path=str(args.resume) if args.resume else None)
     print({"peak_allocated_GiB": torch.cuda.max_memory_allocated()/2**30,
            "peak_reserved_GiB": torch.cuda.max_memory_reserved()/2**30}, flush=True)
-    if not args.memory_test and saver.best_model_path:
+    if args.no_val and not args.memory_test:
+        task.export(args.output / "last.pt", task.current_epoch - 1, float("nan"))
+    elif not args.memory_test and saver.best_model_path:
         saved = torch.load(saver.best_model_path, map_location="cpu", weights_only=False)
         task.load_state_dict(saved["state_dict"])
         task.export(args.output / "best.pt", saved["epoch"], float(saver.best_model_score))

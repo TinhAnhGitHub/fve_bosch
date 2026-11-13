@@ -132,6 +132,27 @@ class Contracts(unittest.TestCase):
         for path in (Path(__file__).parent / "configs").glob("*.json"):
             read_config(path)
 
+    def test_all_train_manifest_and_stop_epoch(self):
+        from prepare import manifest
+        from train import read_config
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for i, body in enumerate((b"a", b"b", b"c")):
+                directory = root / "train" / "fruit" / "berry" / str(i)
+                directory.mkdir(parents=True)
+                (directory / "mesh.ply").write_bytes(body)
+                (directory / "rgb_industrial.png").write_bytes(b"image")
+            out = root / "manifest.json"
+            manifest(SimpleNamespace(data=root, groups=None, seed=42, val_fraction=.1, all_train=True, output=out))
+            self.assertEqual({r["split"] for r in json.loads(out.read_text())["rows"]}, {"train"})
+            config = read_config(Path(__file__).parent / "configs/lora_a100_all.json")
+            self.assertEqual((config["epochs"], config["stop_epoch"]), (20, 5))
+            self.assertEqual(read_config(Path(__file__).parent / "configs/lora_24gb.json")["stop_epoch"], 20)
+            bad = root / "bad.json"
+            bad.write_text(json.dumps({**config, "stop_epoch": 21}))
+            with self.assertRaises(ValueError):
+                read_config(bad)
+
     def test_lightning_fit_checkpoint_and_resume(self):
         import lightning as L
         from lightning.pytorch.callbacks import ModelCheckpoint

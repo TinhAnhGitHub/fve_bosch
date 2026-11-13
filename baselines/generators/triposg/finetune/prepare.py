@@ -46,7 +46,11 @@ def manifest(args):
         hashes[row["mesh_sha256"]] = g
     for row in rows:
         row["group"] = find(row["group"])
-    if getattr(args, "val_ids", None):
+    if getattr(args, "all_train", False):
+        # Final model: every object trains, nothing held out (train.py --no-val, fixed epochs).
+        for row in rows:
+            row["split"] = "train"
+    elif getattr(args, "val_ids", None):
         # Fixed comparison holdout (one id per line). Training rows that share a group or an exact
         # mesh with a holdout row are excluded, so nothing near-identical can leak into training.
         wanted = {line.strip() for line in args.val_ids.read_text().splitlines() if line.strip()}
@@ -148,6 +152,7 @@ def main():
     m.add_argument("--val-ids", type=Path, help="Fixed holdout ids, one per line; overrides --val-fraction")
     m.add_argument("--seed", type=int, default=42)
     m.add_argument("--val-fraction", type=float, default=0.1)
+    m.add_argument("--all-train", action="store_true", help="Every object in the training split, no holdout (final model)")
     e = sub.add_parser("encode")
     e.add_argument("--data", type=Path, required=True)
     e.add_argument("--manifest", type=Path, required=True)
