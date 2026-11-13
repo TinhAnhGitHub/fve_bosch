@@ -13,7 +13,7 @@ This report describes the input and output format, data processing, model archit
 | Best single model, leaderboard | **52.89** (`v27`, positional embedding + right-handed targets, seed 1); `v33` no category input 54.01 |
 | Best single model, local | 33.5 (`s_l1_s0`, L1 Chamfer), but it scored 59.76 on the leaderboard. Local scores do not rank single models (section 8.2) |
 | Most promising new direction | SAM 3D shapes at the true size: about 23 against about 49 for our model on 92 holdout objects (section 9.9). Size is the missing piece |
-| New (2026-11-12): fine-tuned TripoSG | LoRA adapter on our 1,838 training objects: shape at the **true** size 24.5 (median 13.1) against 38.9 (17.4) for our best single model on the same 204 holdout objects. With our own size head it scores 79.3, because that size head is no better than the median size of the food category. Not yet run on the public test; nothing uploaded (section 18) |
+| New (2026-11-12): fine-tuned TripoSG | LoRA adapter on our 1,838 training objects: shape at the **true** size 24.5 (median 13.1) against 38.9 (17.4) for our best single model on the same 204 holdout objects. With our own size head it scores 79.3, because that size head is no better than the median size of the food category. With the size taken from the 2 most alike training photos of the same food type it scores 60.9 (section 18.10): better, but far from RH-Mix5, which would score about 29 on this holdout (43.85 on the leaderboard, divided by the usual 1.5). Run on the public test as files (section 18.7); nothing uploaded (section 18) |
 | Upload next | `v35_e6_mix5_nocat` (RH-Mix5 + no-category model) and `v34_nocat_depth_s0_ema`, both built and checked, not uploaded |
 | Running | IDOL generator on Kaggle (account 3): 204 holdout, then all 2,042 training photos |
 
@@ -1098,18 +1098,22 @@ The size head is no better than the category median, so it has learned the categ
 | 20–30% | 29 | 94.0 | 26.2 |
 | over 30% | 37 | 227.5 | 26.1 |
 
-The shape scores about the same in every row (20–29), while the predicted-size score rises from 23 to 228. The 37 objects with the largest size error add about 40 points to the mean of 79. The size head was trained without dropping the oversized OmniObject3D labels (the finetune code has no such filter), which our Atlas work found important (section 9.1, `v5`).
+The shape scores about the same in every row (20–29), while the predicted-size score rises from 23 to 228. The 37 objects with the largest size error add about 40 points to the mean of 79.
+
+**Correction (2026-11-13).** An earlier version of this paragraph said the size head was trained on oversized OmniObject3D labels. That was wrong. The size head trained on radii from the current, corrected meshes (recomputed from `mesh.ply` for all 2,042 objects, they agree with the holdout labels to 0.6%). The oversized radii (265 objects, 33 of the 204 holdout objects, more than 5 times the current value) are in the old `baselines/out/scale/scale.npz`, which is stale and which the TripoSG size head does not use (`analysis/stale_check.py`). So "drop the oversized labels" is not a fix for this size head.
 
 ### 18.6 Caveats
 
 1. **The pretrained arm saw unmasked photos.** Our photos have no mask and the pipeline pads the full frame, while the zero-shot TripoSG run in section 9.9 used BiRefNet masks (29.6 at true size). So part of LoRA's fivefold gain over "pretrained" in 18.3 may be learning to ignore the background. The fair comparison is 24.5 (LoRA) against 29.6 (masked zero-shot), a gain of 17%, and the two use different scorers. Not yet tested: LoRA on masked photos, or the pretrained arm with a mask.
 2. **One LoRA run, one seed (42).** Epoch 4's validation loss beats epochs 2 to 6 by at most 0.0003, so the choice of epoch 4 is within noise. The best epoch of each arm was picked on the same 204 objects that score it.
-3. **No leaderboard number exists.** Nothing was uploaded and the public test was not run. The 79.3 is a holdout figure and, by section 8.2, leaderboard scores have run 1.3 to 1.7 times local ones for Atlas, but that ratio is unknown for this pipeline.
+3. **No leaderboard number exists.** Nothing was uploaded (the public test has since been run, section 18.7, but only as files). The 79.3 is a holdout figure and, by section 8.2, leaderboard scores have run 1.3 to 1.7 times local ones for Atlas, but that ratio is unknown for this pipeline. Because of that ratio, a holdout mean must be compared with RH-Mix5's holdout equivalent (about 29, from 43.85 / 1.5), not with 43.85, which is a leaderboard score.
 4. **Full fine-tune weights.** The fp32 files (5.7 GB each) were lost when the VM was stopped. fp16 copies are in the Kaggle dataset below. Inference runs in fp16, so those copies give the same clouds.
 
 ### 18.7 Public test: status and how to run it
 
-Not run. Kaggle refused the kernel on 2026-11-12: this account had used 36.93 of its 30 GPU hours, and the quota resets at 2026-11-14 00:00 UTC (07:00 Vietnam time). Everything needed is in place:
+**Update 2026-11-13: run, on a Colab L4 instead of Kaggle.** The 511 clouds (LoRA epoch 4 and our size head, seed 42, 50 steps, depth 7/8) are merged in `baselines/out/triposg/public/lora_eval.npz` and `lora_eval.zip`: ids equal the 511 public photos, 8,192 finite points each, 511 `geometry/<id>.ply` in the zip. The first L4 VM was terminated after 2.5 h (we sent no stop; the cause is unknown) and its 157 finished photos were lost; the other 340 photos were rerun as 12-way shards in 2 h 31 min (about 2.2 photos per minute, about 25 compute units), see `finetune/colab/`. Nothing was uploaded. This zip is the size head's version, which scores 79.3 on the holdout and should not be uploaded; the same clouds at the look-alike size are in section 18.10.
+
+What follows is the Kaggle route, which has not run for this public test. On 2026-11-12 Kaggle refused the kernel: this account had used 36.93 of its 30 GPU hours, and the quota resets at 2026-11-14 00:00 UTC (07:00 Vietnam time). Everything needed is in place:
 
 | Item | Where |
 |---|---|
@@ -1124,9 +1128,10 @@ The kernel has never run: its setup (torch 2.5.1 + cu124, `diso` built for the T
 
 1. **Free, on this machine:** how accurate is Atlas's own size on the same 204 objects? If it beats the category median, LoRA can use it.
 2. **Free, on this machine:** place the LoRA shape at several sizes around Atlas's size (hedge), at a calibrated factor, and mix some LoRA points into RH-Mix5. Judge each against RH-Mix5's own holdout score under the same strict scorer.
-3. **Size model retrain, on Colab or Kaggle:** drop the oversized training labels, use DINOv3 features as Atlas does, average several models. A bigger network on the same inputs is unlikely to help, because the category median already matches it.
-4. **Only if one of these beats RH-Mix5 on the holdout:** run LoRA on the 511 public photos and build that combination as a zip. Do not upload a lone LoRA + size-head zip: its holdout score of 79 would rank far below 43.85.
+3. **Size model:** the look-alike size of section 18.10 is better than the size head (squared radius error 39.5 against 55.9) and is the size model to build on. The earlier idea to "drop the oversized training labels" is withdrawn (correction in 18.5). A bigger network on the same inputs is unlikely to help, because the category median already matches the head.
+4. **Only if one of these beats RH-Mix5 on the holdout:** build that combination as a zip from the public clouds, which now exist (18.7). Do not upload a lone LoRA zip: at the look-alike size it scores 60.9 on the holdout (about 29 is the bar), at the size head's size 79.3.
 5. Remove the mask confound in 18.6 (masked photos) and add a second LoRA seed before relying on the 24.5.
+6. **Mixing the LoRA into RH-Mix5** is the one route with a chance. It needs RH-Mix5's holdout clouds, which are not cached (`v27` and `v26` would have to be rebuilt from their checkpoints; `analysis/mix_lora.py` is a first draft, never run), and a per-object rule for when to trust the LoRA, for example only where the look-alikes are close and agree.
 
 ### 18.9 Practical notes from the run
 
@@ -1134,4 +1139,61 @@ The kernel has never run: its setup (torch 2.5.1 + cu124, `diso` built for the T
 - Loading TripoSG from the Hugging Face repo id fails on its custom scheduler entry. `predict.py` now downloads a snapshot and loads from the local path.
 - `predict.py` writes its output only after the last object, so a half-finished arm has no score. Scoring one arm locally takes 10 to 14 minutes on 14 CPU cores.
 - `predict.py` has `--shard` and `--num-shards`, and `merge.py` joins the shards into the challenge zip (exactly 8,192 points per object, `geometry/{id}.ply`).
-- Scripts behind the numbers are in `finetune/analysis/`: `fm_diag.py` and `lora_diag.py` (18.2, run on the GPU VM), `score_local.py` (18.3, parallel version of `evaluate.py`), `size_baselines.py` and `radius_check.py` (18.5). The last three run from `baselines/out/triposg/holdout/` and need `metadata.json` and the `*_val.npz` files there. The 18.4 numbers come from `trellis_score.py` run on `lora_val.npz`.
+- Scripts behind the numbers are in `finetune/analysis/`: `fm_diag.py` and `lora_diag.py` (18.2, run on the GPU VM), `score_local.py` (18.3, parallel version of `evaluate.py`), `size_baselines.py` and `radius_check.py` (18.5). The last three run from `baselines/out/triposg/holdout/` and need `metadata.json` and the `*_val.npz` files there. The 18.4 numbers come from `trellis_score.py` run on `lora_val.npz`. The 18.10 numbers come from `size_lookalike.py` and `hedge_surrogate.py`, which run with `uv run --no-project --with numpy --with scipy --with trimesh python -I <script>` (the usage is at the top of each script).
+
+### 18.10 Look-alike size for the LoRA shape (2026-11-13)
+
+**The idea.** The LoRA draws the shape without a trustworthy size, so take the size from the training photos instead (the method of the sister volume task's B3.4). For each photo: (1) the 2 training photos of the same food type whose image features are closest (cosine on standardized SigLIP2 CLS features of three layers); their real radii, averaged in log space; (2) a ridge formula on the same features, as a correction around the food type's median radius; (3) the type median. The three are mixed in log space and the LoRA's unit-RMS cloud is scaled to that radius with `common.metric_points`, so only the size number changes. Chosen out-of-fold on the pool: SigLIP2 features (of 7 feature choices tried; the best four are within 2 mm² of squared radius error of each other, so the choice is not sharp), ridge alpha 100, weights 0 / 0.95 / 0.05 for type median / look-alikes / formula. The formula adds almost nothing: the ridge alone is barely better than the type median (101.5 against 111.0 mm² out of fold). The volume model's guess (listed as optional) was not used: its look-alike part is this same idea on volume, and its fine-tuned part has no out-of-fold guesses for our holdout.
+
+**No leakage.** The 204 holdout objects are never in the pool (pool = the 1,838 train objects). The features, the ridge strength and the mix weights were chosen out-of-fold on that pool (leave-one-out for the look-alikes with identical meshes also left out, 10 folds by mesh for the ridge) and the holdout was judged once. For the public photos the pool is all 2,042 training objects with the same settings. The cached features come from the volume task; its photos are byte-identical to ours (checked for all 2,553). Closeness check, cosine similarity of the best same-type look-alike, percentiles 10 / 25 / 50 / 75 / 90:
+
+| Queries and pool | 10 | 25 | 50 | 75 | 90 |
+|---|---|---|---|---|---|
+| Train pool, leave one out | 0.506 | 0.625 | 0.734 | 0.816 | 0.865 |
+| Holdout, train pool | 0.534 | 0.622 | 0.723 | 0.814 | 0.858 |
+| Public photos, all 2,042 | 0.488 | 0.617 | 0.731 | 0.812 | 0.868 |
+
+The holdout is as close to its pool as the public photos are to theirs, so it does not flatter the method. Re-weighting the holdout errors to the public photos' closeness gives a squared radius error of 39.1 for the blend (39.5 measured) and 55.8 for the head (55.9 measured).
+
+**Size accuracy, 204 holdout objects.**
+
+| Size guess | Median error | Within 10% | Off by >30% | Squared radius error (mm²) |
+|---|---|---|---|---|
+| Type median | 13.2% | 42% | 19% | 87.5 |
+| Our size head | 13.4% | 41% | 18% | 55.9 |
+| Look-alikes, K = 2 | 8.5% | 55% | 11% | 40.2 |
+| Ridge formula | 12.4% | 44% | 17% | 80.0 |
+| **Blend (the plan)** | **8.2%** | **54%** | **11%** | **39.5** |
+
+Out of fold on the 1,838-object pool the same blend gives 7.2% / 60% / 11% / 50.6, against 10.8% / 48% / 21% / 111.0 for the type median.
+
+**Score, the local scorer of 18.3 (my harness reproduces the saved 79.27 and 24.17 to 0.01).**
+
+| LoRA at | Mean CD-L2 | Median |
+|---|---|---|
+| Size head's guess | 79.27 | 33.41 |
+| **Look-alike size** | **60.87** | **27.18** |
+| True size (oracle) | 24.17 | 11.87 |
+
+The look-alike size is better than the size head's on 124 of 204 objects. As before, the score lost to the size error is almost the squared radius error (36.7 against 39.5 here, 55.1 against 55.9 for the head). So a mean score under 43.85 needs a squared radius error of about 20, and a score near the roughly 29 of RH-Mix5 needs about 5.
+
+**Where the error is.** The 10 worst objects carry 44% of the squared radius error, the 40 worst 82%. The 22 objects with a radius above 50 mm carry 40% (watermelon halves, a large pancake, nachos, steak, sausage). On several of the worst, the size head is closer than the look-alikes. An exploratory geometric mean of the head and the blend lowers the squared radius error from 39.5 to about 33, but the head has no out-of-fold guesses for the pool, so its weight cannot be chosen honestly without retraining it by fold.
+
+**A size hedge** (`hedge_surrogate.py`, a fast stand-in for the scorer that keeps each cloud in its true-size pose and only rescales it; within about 5% of the real scorer on the arms checked: 25.5 against 24.2 at the true size, 75.0 against 79.3 at the head's size, 61.4 against 60.9 at the look-alike size). Mean CD on the 204 holdout objects:
+
+| Cloud | Mean | Median |
+|---|---|---|
+| One size, look-alike | 61.4 | 29.7 |
+| 3 copies at (0.9, 1, 1.1), a third of the points each | 52.7 | 25.4 |
+| 5 copies at (0.84, 0.92, 1, 1.08, 1.16), weights 1:2:3:2:1 | **50.1** | 25.2 |
+| 5 copies, narrower (0.90 ... 1.10), d = 0.05 | 51.8 | 25.0 |
+| 5 copies, wider (0.76 ... 1.24), d = 0.12 | 52.8 | 30.7 |
+| 5 copies, much wider (0.68 ... 1.32), d = 0.16 | 60.0 | 36.5 |
+| Hedge width set per object from the look-alikes' closeness and agreement | 59 to 80 | |
+| One size, radius times 0.97 | 60.0 | |
+
+A narrow fixed hedge helps by about 18%; a per-object width does not. 50 is still far above the roughly 29 of RH-Mix5 on this holdout. Not scored by the real scorer.
+
+**Verdict.** The look-alike size is a real gain on the size head (79.3 to 60.9) but does not meet the rule "upload only if it beats 43.85 on the holdout". It is also the wrong yardstick: 43.85 is the leaderboard score of RH-Mix5 on the public test, and leaderboard scores have run 1.3 to 1.7 times holdout scores (section 8.2), so on this holdout RH-Mix5 would score about 29 (an estimate: RH-Mix5 itself has not been scored on this holdout with this scorer). A standalone LoRA submission therefore does not look like a route to a better leaderboard score, even with a hedge (about 50). Built, not uploaded: `f3dr_submissions/v36_lora_lookalike_size/preds_geometry.zip` (511 clouds, 8,192 points each, ids equal to the public photos, radii from the 2,042-object pool; median new radius 31.4 mm against 30.8 mm for the head).
+
+**Open.** (1) Mix LoRA points into RH-Mix5, with a per-object rule based on the look-alikes (item 6 of 18.8). (2) Out-of-fold size-head guesses for the pool, to weight the head and the look-alikes honestly. (3) Real-scorer numbers for the hedge.
