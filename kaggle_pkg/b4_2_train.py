@@ -36,12 +36,17 @@ from transformers import AutoModel
 SIZE, GRID = 512, 32
 BLOCKS = (7, 15, 23, 31)  # 0-based block indices -> layers 8/16/24/32
 N_AUX = 8
+CROP = 0  # --crop: centre-crop side (px of the 1024 frame) before the resize; 0 = full frame
 
 
 # ------------------------------------------------------------------ data
 def load_images(paths: list[Path]) -> torch.Tensor:
     def one(p: Path) -> np.ndarray:
-        return np.asarray(Image.open(p).convert("RGB").resize((SIZE, SIZE), Image.BICUBIC))
+        im = Image.open(p).convert("RGB")
+        if CROP:  # objects are auto-framed and centred: 99.3% fit in the central 768 of 1024
+            c = (im.width - CROP) // 2
+            im = im.crop((c, c, c + CROP, c + CROP))
+        return np.asarray(im.resize((SIZE, SIZE), Image.BICUBIC))
     with ThreadPoolExecutor(8) as ex:
         arr = np.stack(list(ex.map(one, paths)))
     return torch.from_numpy(arr).permute(0, 3, 1, 2).contiguous()
@@ -129,6 +134,32 @@ class XBlock(nn.Module):
         return x + self.mlp(self.n3(x))
 
 
+R_MAX = 2.5
+
+
+def bin_centers(k: int) -> torch.Tensor:
+    w = 2 * R_MAX / max(k, 1)
+    return -R_MAX + w / 2 + w * torch.arange(k, dtype=torch.float32)
+
+
+def hl_gauss(logits: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+    """Per-row HL-Gauss cross-entropy (Imani & White 2018; Farebrother et al. 2024): target = N(r, sigma) integrated over
+    the bins, sigma = 0.75 bin width."""
+    k = logits.shape[1]; w = 2 * R_MAX / k
+    edges = -R_MAX + w * torch.arange(k + 1, dtype=torch.float32)
+    cdf = torch.special.ndtr((edges[None] - r.clamp(-R_MAX, R_MAX)[:, None]) / (0.75 * w))
+    t = cdf[:, 1:] - cdf[:, :-1]
+    t = t / t.sum(1, keepdim=True)
+    return -(t * logits.log_softmax(-1)).sum(1)
+
+
+def smape_opt(logits: np.ndarray) -> np.ndarray:
+    """sMAPE-optimal point of the predicted bin distribution: argmin_t sum_k p_k 2 tanh(|t - c_k| / 2), t on the bin grid."""
+    c = bin_centers(logits.shape[1]).numpy()
+    p = np.exp(logits - logits.max(1, keepdims=True)); p /= p.sum(1, keepdims=True)
+    return c[np.argmin(p @ (2 * np.tanh(np.abs(c[:, None] - c[None]) / 2)), 1)]
+
+
 def sincos_2d(g: int, w: int) -> torch.Tensor:
     """Fixed 2D sine-cosine position code for a g x g token grid, [g*g, w] (w divisible by 4)."""
     v = torch.arange(g, dtype=torch.float32)
@@ -145,8 +176,17 @@ class QueryDecoder(nn.Module):
     first prediction is the cluster constant (r = 0, logit 0)."""
 
     def __init__(self, d_in: int, d_sum: int, n_levels: int, n_out: int, w: int = 256, depth: int = 4, heads: int = 8,
-                 p_drop: float = 0.1) -> None:
+                 p_drop: float = 0.1, n_bins: int = 0, skip: bool = False) -> None:
         super().__init__()
+        # n_bins: the r query also emits n_bins logits over [-R_MAX, R_MAX] (HL-Gauss); output col 0 becomes their mean.
+        # skip: zero-init linear path summary -> all outputs, so training starts as a linear probe (B6 sat on a plateau).
+        self.n_bins = n_bins
+        self.bins = nn.Linear(w, n_bins) if n_bins else None
+        self.skip = nn.Sequential(nn.LayerNorm(d_sum), nn.Linear(d_sum, n_out + n_bins)) if skip else None
+        for m in (self.bins, self.skip[1] if skip else None):
+            if m is not None:
+                nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+        self.register_buffer("centers", bin_centers(n_bins), persistent=False)
         self.proj = nn.ModuleList([nn.Linear(d_in, w) for _ in range(n_levels)])
         self.sum_in = nn.Linear(d_sum, w)
         self.norm_mem = nn.LayerNorm(w)
@@ -163,7 +203,15 @@ class QueryDecoder(nn.Module):
         x = self.queries.expand(mem.shape[0], -1, -1)
         for blk in self.blocks:
             x = blk(x, mem)
-        return (self.norm(x) * self.out_w).sum(-1) + self.out_b
+        x = self.norm(x)
+        o = (x * self.out_w).sum(-1) + self.out_b
+        if self.n_bins:
+            o = torch.cat([o, self.bins(x[:, 0])], 1)
+        if self.skip is not None:
+            o = o + self.skip(summary)
+        if self.n_bins:
+            o = torch.cat([(o[:, -self.n_bins:].softmax(-1) * self.centers).sum(-1, keepdim=True), o[:, 1:]], 1)
+        return o
 
 
 IM_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -179,7 +227,7 @@ class Net(nn.Module):
     """backbone 'radio' (C-RADIOv4-H, local code) or 'dinov3' (HF DINOv3 ViT-L/16): LoRA + multi-layer conv head."""
 
     def __init__(self, model_dir: str, backbone: str, dtype: torch.dtype, last_only: bool, lora_r: int, drop_path: float,
-                 head: str = "conv", n_out: int = 2 + N_AUX) -> None:
+                 head: str = "conv", n_out: int = 2 + N_AUX, n_bins: int = 0, skip: bool = False) -> None:
         super().__init__()
         self.kind = backbone
         if backbone == "radio":
@@ -210,8 +258,9 @@ class Net(nn.Module):
                 p.data = p.data.float()
         with torch.no_grad():
             _, s = self.encode(torch.zeros(1, 3, SIZE, SIZE, device="cuda", dtype=dtype))
-        cls = QueryDecoder if head == "decoder" else Head
-        self.head = cls(d, s.shape[-1], len(self.taps), n_out).cuda()
+        assert head == "decoder" or not (n_bins or skip), "--bins/--skip need --head decoder"
+        self.head = (QueryDecoder(d, s.shape[-1], len(self.taps), n_out, n_bins=n_bins, skip=skip) if head == "decoder"
+                     else Head(d, s.shape[-1], len(self.taps), n_out)).cuda()
 
     def encode(self, x: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
         n = GRID * GRID
@@ -270,12 +319,17 @@ def main() -> None:
     ap.add_argument("--scale-aug", type=float, default=0.0, help="+- scale jitter, e.g. 0.15")
     ap.add_argument("--drop-path", type=float, default=0.0, help="stochastic depth (dinov3 backbone only)")
     ap.add_argument("--head", default="conv", choices=["conv", "decoder"], help="conv head (B4.1/B4.2) or query decoder (B6)")
+    ap.add_argument("--crop", type=int, default=0, help="centre-crop side before resize, e.g. 768 (B7)")
+    ap.add_argument("--skip", action="store_true", help="zero-init linear summary -> outputs path (B7)")
+    ap.add_argument("--bins", type=int, default=0, help="HL-Gauss bins for r, e.g. 64 (B7); 0 = smooth-L1")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--data", default="/kaggle/input/fve-bosch-data")
     ap.add_argument("--prep", default="/kaggle/input/fve-b42-prep")
     ap.add_argument("--model", default="/kaggle/input/cradio-v4-h")
     ap.add_argument("--out", default="/kaggle/working/out")
     a = ap.parse_args()
+    global CROP
+    CROP = a.crop
     out_dir = Path(a.out) / f"f{a.fold}"; out_dir.mkdir(parents=True, exist_ok=True)
     dtype = torch.float32 if a.fp32 else DTYPES[a.dtype]
     rows = pd.read_csv(Path(a.prep) / "rows.csv")
@@ -293,7 +347,8 @@ def main() -> None:
 
     torch.manual_seed(a.fold)
     rng = np.random.default_rng(a.fold)
-    net = Net(a.model, a.backbone, dtype, a.last_only, a.lora_r, a.drop_path, a.head, 2 + d["aux"].shape[1])
+    net = Net(a.model, a.backbone, dtype, a.last_only, a.lora_r, a.drop_path, a.head, 2 + d["aux"].shape[1], a.bins, a.skip)
+    n_aux = d["aux"].shape[1]
     lora = [p for p in net.backbone.parameters() if p.requires_grad]
     head_p = list(net.head.parameters())
     print(f"taps {net.taps}; trainable LoRA {sum(p.numel() for p in lora) / 1e6:.2f}M + head "
@@ -342,9 +397,11 @@ def main() -> None:
                 out = net(x)
             out = out.float()
             ii = torch.as_tensor(idx)
-            l_r = (F.smooth_l1_loss(out[:, 0].cpu(), r_t[ii], reduction="none", beta=0.3) * ok_t[ii]).sum() / ok_t[ii].sum().clamp(min=1)
+            l_rows = hl_gauss(out[:, -a.bins:].cpu(), r_t[ii]) if a.bins else \
+                F.smooth_l1_loss(out[:, 0].cpu(), r_t[ii], reduction="none", beta=0.3)
+            l_r = (l_rows * ok_t[ii]).sum() / ok_t[ii].sum().clamp(min=1)
             l_u = (F.binary_cross_entropy_with_logits(out[:, 1].cpu(), u_t[ii] * (1 - a.label_smooth) + 0.5 * a.label_smooth, reduction="none") * mx_t[ii]).sum() / mx_t[ii].sum().clamp(min=1)
-            l_a = F.l1_loss(out[:, 2:].cpu(), aux_t[ii])
+            l_a = F.l1_loss(out[:, 2:2 + n_aux].cpu(), aux_t[ii])
             loss = l_r + 0.5 * l_u + 0.1 * l_a
             if not torch.isfinite(loss):
                 bad += 1
@@ -376,6 +433,9 @@ def main() -> None:
     out_q, out_v = predict(net, imgs_q, dtype), predict(net, imgs_v, dtype)
     sm = smape(q_y, decode(out_q, q_b0, q_b1))
     print(f"\nFINAL fold {a.fold}: held-out sMAPE (EMA weights) {sm:.2f}", flush=True)
+    if a.bins:
+        o2 = out_q.copy(); o2[:, 0] = smape_opt(out_q[:, -a.bins:])
+        print(f"  bins decoded at the sMAPE-optimal point instead of the mean: {smape(q_y, decode(o2, q_b0, q_b1)):.2f}", flush=True)
     if "aux_mean" in d:  # aux = [3 sorted ln bbox dims (cm), ln fill, ...]: their sum is ln volume, with no category table
         geo = (out_q[:, 2:6] * d["aux_std"][:4] + d["aux_mean"][:4]).sum(1)
         print(f"geometric readout (dims + fill, category-free) sMAPE {smape(q_y, geo):.2f}", flush=True)
