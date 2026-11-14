@@ -176,8 +176,12 @@ class QueryDecoder(nn.Module):
     first prediction is the cluster constant (r = 0, logit 0)."""
 
     def __init__(self, d_in: int, d_sum: int, n_levels: int, n_out: int, w: int = 256, depth: int = 4, heads: int = 8,
-                 p_drop: float = 0.1, n_bins: int = 0, skip: bool = False) -> None:
+                 p_drop: float = 0.1, n_bins: int = 0, skip: bool = False, n_nb: int = 0) -> None:
         super().__init__()
+        # n_nb (S3, --retr): retrieved same-category training neighbours [label, u, cos, valid, PCA diff] become extra
+        # memory tokens, so every measurement query can read the neighbours' sizes next to the image tokens
+        self.nb_in = nn.Sequential(nn.Linear(n_nb, w), nn.GELU(), nn.Linear(w, w)) if n_nb else None
+        self.nb_type = nn.Parameter(torch.zeros(w)) if n_nb else None
         # n_bins: the r query also emits n_bins logits over [-R_MAX, R_MAX] (HL-Gauss); output col 0 becomes their mean.
         # skip: zero-init linear path summary -> all outputs, so training starts as a linear probe (B6 sat on a plateau).
         self.n_bins = n_bins
@@ -197,9 +201,10 @@ class QueryDecoder(nn.Module):
         self.out_b = nn.Parameter(torch.zeros(n_out))
         self.register_buffer("pos", sincos_2d(GRID, w), persistent=False)
 
-    def forward(self, feats: list[torch.Tensor], summary: torch.Tensor) -> torch.Tensor:
+    def forward(self, feats: list[torch.Tensor], summary: torch.Tensor, nb: torch.Tensor | None = None) -> torch.Tensor:
         mem = sum(p(f.flatten(2).transpose(1, 2)) for p, f in zip(self.proj, feats)) + self.pos
-        mem = self.norm_mem(torch.cat([self.sum_in(summary)[:, None], mem], 1))
+        parts = [self.sum_in(summary)[:, None], mem] + ([self.nb_in(nb) + self.nb_type] if self.nb_in is not None else [])
+        mem = self.norm_mem(torch.cat(parts, 1))
         x = self.queries.expand(mem.shape[0], -1, -1)
         for blk in self.blocks:
             x = blk(x, mem)
@@ -227,7 +232,7 @@ class Net(nn.Module):
     """backbone 'radio' (C-RADIOv4-H, local code) or 'dinov3' (HF DINOv3 ViT-L/16): LoRA + multi-layer conv head."""
 
     def __init__(self, model_dir: str, backbone: str, dtype: torch.dtype, last_only: bool, lora_r: int, drop_path: float,
-                 head: str = "conv", n_out: int = 2 + N_AUX, n_bins: int = 0, skip: bool = False) -> None:
+                 head: str = "conv", n_out: int = 2 + N_AUX, n_bins: int = 0, skip: bool = False, n_nb: int = 0) -> None:
         super().__init__()
         self.kind = backbone
         if backbone == "radio":
@@ -259,7 +264,7 @@ class Net(nn.Module):
         with torch.no_grad():
             _, s = self.encode(torch.zeros(1, 3, SIZE, SIZE, device="cuda", dtype=dtype))
         assert head == "decoder" or not (n_bins or skip), "--bins/--skip need --head decoder"
-        self.head = (QueryDecoder(d, s.shape[-1], len(self.taps), n_out, n_bins=n_bins, skip=skip) if head == "decoder"
+        self.head = (QueryDecoder(d, s.shape[-1], len(self.taps), n_out, n_bins=n_bins, skip=skip, n_nb=n_nb) if head == "decoder"
                      else Head(d, s.shape[-1], len(self.taps), n_out)).cuda()
 
     def encode(self, x: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
@@ -275,19 +280,20 @@ class Net(nn.Module):
         feats = [out.hidden_states[t][:, -n:].transpose(1, 2).reshape(x.shape[0], -1, GRID, GRID) for t in self.taps]
         return feats, torch.cat([h[:, 0], h[:, self.n_prefix:].mean(1)], 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, nb: torch.Tensor | None = None) -> torch.Tensor:
         feats, summary = self.encode(x)
-        return self.head([f.float() for f in feats], summary.float())
+        return self.head([f.float() for f in feats], summary.float(), *([] if nb is None else [nb]))
 
 
 @torch.inference_mode()
-def predict(net: Net, imgs: torch.Tensor, dtype, batch: int = 8) -> np.ndarray:
+def predict(net: Net, imgs: torch.Tensor, dtype, batch: int = 8, nb: torch.Tensor | None = None) -> np.ndarray:
     net.eval()
     outs = []
     for i in range(0, len(imgs), batch):
         x = (imgs[i:i + batch].cuda().float() / 255).to(dtype)
         with torch.autocast("cuda", dtype=amp_dtype(dtype) or torch.float16, enabled=amp_dtype(dtype) is not None):
-            o = (net(x) + net(x.flip(-1))) / 2
+            n_b = None if nb is None else nb[i:i + batch].cuda()
+            o = (net(x, n_b) + net(x.flip(-1), n_b)) / 2
         outs.append(o.float().cpu().numpy())
     return np.concatenate(outs)
 
@@ -322,6 +328,7 @@ def main() -> None:
     ap.add_argument("--crop", type=int, default=0, help="centre-crop side before resize, e.g. 768 (B7)")
     ap.add_argument("--skip", action="store_true", help="zero-init linear summary -> outputs path (B7)")
     ap.add_argument("--bins", type=int, default=0, help="HL-Gauss bins for r, e.g. 64 (B7); 0 = smooth-L1")
+    ap.add_argument("--retr", default="", help="S3: dir with retr{fold}.npz (s3_prep.py) -> neighbour tokens in the decoder")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--data", default="/kaggle/input/fve-bosch-data")
     ap.add_argument("--prep", default="/kaggle/input/fve-b42-prep")
@@ -345,9 +352,14 @@ def main() -> None:
     imgs_v = load_images(P(va_rows.iloc[:16] if a.smoke else va_rows, "val"))
     print(f"fold {a.fold}: train {len(tr_idx)} held-out {len(va_idx)} val {len(imgs_v)}; images in {time.time() - t0:.0f}s", flush=True)
 
+    nb_t = nb_q = nb_v = None
+    if a.retr:
+        rt = np.load(Path(a.retr) / f"retr{a.fold}.npz")
+        nb_t, nb_q, nb_v = (torch.from_numpy(rt[k][:n] if a.smoke else rt[k]) for k, n in (("nb_t", 24), ("nb_q", 16), ("nb_v", 16)))
     torch.manual_seed(a.fold)
     rng = np.random.default_rng(a.fold)
-    net = Net(a.model, a.backbone, dtype, a.last_only, a.lora_r, a.drop_path, a.head, 2 + d["aux"].shape[1], a.bins, a.skip)
+    net = Net(a.model, a.backbone, dtype, a.last_only, a.lora_r, a.drop_path, a.head, 2 + d["aux"].shape[1], a.bins, a.skip,
+              0 if nb_t is None else nb_t.shape[-1])
     n_aux = d["aux"].shape[1]
     lora = [p for p in net.backbone.parameters() if p.requires_grad]
     head_p = list(net.head.parameters())
@@ -378,7 +390,7 @@ def main() -> None:
 
     def evaluate() -> float:
         bk = swap_ema()
-        out = predict(net, imgs_q, dtype)
+        out = predict(net, imgs_q, dtype, nb=nb_q)
         restore(bk); net.train()
         return smape(q_y, decode(out, q_b0, q_b1))
 
@@ -394,7 +406,7 @@ def main() -> None:
             idx = perm[b * a.batch:(b + 1) * a.batch]
             x = augment(imgs_t[idx].cuda().float() / 255, rng, a.scale_aug).to(dtype)
             with torch.autocast("cuda", dtype=amp or torch.float16, enabled=amp is not None):
-                out = net(x)
+                out = net(x, None if nb_t is None else nb_t[idx].cuda())
             out = out.float()
             ii = torch.as_tensor(idx)
             l_rows = hl_gauss(out[:, -a.bins:].cpu(), r_t[ii]) if a.bins else \
@@ -430,7 +442,7 @@ def main() -> None:
         print(msg, flush=True)
 
     bk = swap_ema()
-    out_q, out_v = predict(net, imgs_q, dtype), predict(net, imgs_v, dtype)
+    out_q, out_v = predict(net, imgs_q, dtype, nb=nb_q), predict(net, imgs_v, dtype, nb=nb_v)
     sm = smape(q_y, decode(out_q, q_b0, q_b1))
     print(f"\nFINAL fold {a.fold}: held-out sMAPE (EMA weights) {sm:.2f}", flush=True)
     if a.bins:
