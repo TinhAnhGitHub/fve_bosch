@@ -33,7 +33,12 @@ def main():
     # One process per GPU: shard K of N takes rows K, K+N, ...; sharded runs write only the npz (merge.py packs the zip).
     p.add_argument("--shard", type=int, default=0)
     p.add_argument("--num-shards", type=int, default=1)
+    p.add_argument("--allow-size-cache-mismatch", action="store_true",
+                   help="With --split eval only: pair a shape adapter and a size head from different caches "
+                        "(the public photos are in neither cache, so nothing can leak)")
     args = p.parse_args()
+    if args.allow_size_cache_mismatch and args.split != "eval":
+        p.error("--allow-size-cache-mismatch is only valid with --split eval")
     if not 0 <= args.shard < args.num_shards:
         p.error("need 0 <= shard < num-shards")
     if args.steps <= 0:
@@ -51,10 +56,14 @@ def main():
     # A repo id fails in diffusers' download check (custom scheduler in model_index.json); a local snapshot loads like upstream's script.
     weights = snapshot_download(meta["model"], revision=meta["revision"])
     pipe = TripoSGPipeline.from_pretrained(weights, torch_dtype=dtype).to("cuda")
+    shape_cache_hash = ""
     if args.shape:
         shape = torch.load(args.shape, map_location="cpu", weights_only=False)
-        if shape["schema"] != SCHEMA or shape["phase"] != "shape" or shape["cache_hash"] != size["cache_hash"]:
+        if shape["schema"] != SCHEMA or shape["phase"] != "shape":
+            raise ValueError("Expected shape-phase checkpoint")
+        if shape["cache_hash"] != size["cache_hash"] and not args.allow_size_cache_mismatch:
             raise ValueError("Shape and size artifacts must use the same cache/split")
+        shape_cache_hash = shape["cache_hash"]
         configure_transformer(pipe.transformer, shape["config"])
         restore_model(pipe.transformer, shape["state"], shape["config"]["mode"])
         del shape
@@ -96,7 +105,8 @@ def main():
     np.savez(args.output, ids=np.array(ids), pts=np.stack(clouds), unit=np.stack(units),
              radius_mm=np.array(radii), seed=args.seed, steps=args.steps,
              dense_depth=args.dense_depth, hierarchical_depth=args.hierarchical_depth,
-             cache_hash=size["cache_hash"], shape_checkpoint=str(args.shape or "pretrained"))
+             cache_hash=size["cache_hash"], shape_cache_hash=shape_cache_hash if args.shape else "",
+             shape_checkpoint=str(args.shape or "pretrained"))
     if args.num_shards > 1:
         return
     # Challenge archive uses existing repository point-count/path validation.

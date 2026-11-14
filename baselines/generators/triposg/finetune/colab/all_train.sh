@@ -78,7 +78,7 @@ predict)
     for s in "$@"; do
       [ -f $W/pub_e$E/s$s.npz ] && continue
       $PY predict.py --upstream /content/TripoSG --data $DATA --size /content/size_best.pt --shape $W/lora_all/epoch$E.pt \
-          --split eval --steps 50 --guidance 7 --precision fp16 --dense-depth 7 --hierarchical-depth 8 \
+          --split eval --steps 50 --guidance 7 --precision fp16 --dense-depth 7 --hierarchical-depth 8 --allow-size-cache-mismatch \
           --shard $s --num-shards 8 --output $W/pub_e$E/s$s.npz > $W/pub_e$E/s$s.log 2>&1 || return 1
     done
   }
