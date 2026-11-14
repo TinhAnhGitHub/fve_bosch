@@ -52,7 +52,7 @@ Everything in 1-4 is rebuilt from the TRAINING part of each fold only, so held-o
 5. Decode: oversized cluster if `p > 0.5`, ln prediction = cluster constant + clipped r.
 6. Submission (`b3_4_knn.submit`): refit on ALL train, predict val, write the zip.
 
-Why the board beats CV for this track: at submission time the kNN bank is all 2,042 train objects (80% in CV).
+Board for this track was 48.69 (trained on the older labels), far above its CV; see EXPERIMENTS.md.
 
 ## 4. Fine-tuning track (B4.x)
 Data prep for fine-tuning (`experiments/b4_2_prep.py` -> `kaggle_pkg/b42_prep/`):
