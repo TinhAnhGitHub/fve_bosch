@@ -29,6 +29,7 @@ assert (n_tr, n_ev) == (2042, 511)
 specs = os.environ["SPECS"].split()
 cmd = ["bash", "-c", 'python /content/feat/extract_feats.py "$@" > /content/feat/run.log 2>&1', "_", train, ev,
        "/content/feat/out", *specs]
-subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                 stderr=subprocess.DEVNULL)
-print("LAUNCHED", specs)
+# Blocking on purpose: Colab reclaims a VM whose kernel sits idle (~20 min), so the kernel waits for the extractor.
+print("RUNNING", specs, flush=True)
+r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("EXIT", r.returncode)

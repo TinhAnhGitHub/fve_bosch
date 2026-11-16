@@ -35,7 +35,7 @@ import torch.nn as nn
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT.parent / "data" / "f3d"
-FEAT_DIR = ROOT.parent / "fve_bosch" / "features"
+FEAT_DIRS = (ROOT.parent / "fve_bosch" / "features", ROOT / "baselines" / "out" / "atlas" / "feats")  # Track 2 files; ours (tools/extract_feats.py)
 FOLDS = ROOT / "baselines" / "folds" / "f3dr_k5_v1.csv"
 FEATS = ("dinov2l_reg_518", "dinov3_vith16plus_512", "siglip2_so400m_512", "dinov3_vitl16_512", "dinov3_vitl16_768")
 CLS_BLOCKS = (0, 2, 4)  # each feature file holds 6 blocks: CLS and mean patch of 3 layers
@@ -46,10 +46,10 @@ K_SUB = 8   # model seeds averaged for the eval photos (trained on all 2,042)
 G: dict = {}  # filled before the pool forks
 
 
-def features(keys: list[str]) -> np.ndarray:
+def features(keys: list[str], stems: tuple[str, ...]) -> np.ndarray:
     parts = []
-    for stem in FEATS:
-        z = np.load(FEAT_DIR / f"{stem}.npz")
+    for stem in stems:
+        z = np.load(next(d / f"{stem}.npz" for d in FEAT_DIRS if (d / f"{stem}.npz").exists()))
         row = {k: i for i, k in enumerate(z["keys"])}
         X = z["X"][[row[k] for k in keys]]
         d = X.shape[1] // 6
@@ -191,6 +191,8 @@ def main() -> None:
     out_dir = Path(sys.argv[1])
     weighted = "--weighted" in sys.argv[2:]
     axes = "--axes" in sys.argv[2:]
+    opt = dict(a[2:].split("=", 1) for a in sys.argv[2:] if "=" in a)  # --feats=a,b replaces FEATS; --add=a,b adds
+    stems = tuple(opt["feats"].split(",")) if "feats" in opt else FEATS + tuple(opt.get("add", "").split(",") if "add" in opt else ())
     t0 = time.time()
     with open(FOLDS) as f:
         rows = list(csv.DictReader(f))
@@ -203,8 +205,8 @@ def main() -> None:
     eids = [p.name for p in eval_dirs]
     ecat = np.array([p.parent.name for p in eval_dirs])
     egrp = np.array([p.parent.parent.name for p in eval_dirs])
-    X = features([f"train/{i}" for i in ids])
-    Xe = features([f"val/{i}" for i in eids])
+    X = features([f"train/{i}" for i in ids], stems)
+    Xe = features([f"val/{i}" for i in eids], stems)
     y = 3 * np.log(radius)
     if weighted:
         med = {c: np.median(radius[cat == c]) for c in np.unique(cat)}
