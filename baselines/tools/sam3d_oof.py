@@ -68,13 +68,25 @@ def main() -> None:
     knn_r = np.exp(sz["oof_ln_r"][s_r])
     ours = pts * ((0.85 * knn_r / own) ** 0.25)[:, None, None]
 
-    names = ["ours"] + [f"sam_k{k:.2f}" for k in KS] + ["sam_true", "sam_flip"] + [f"mix_k{k:.2f}" for k in KS]
+    # ours resized per axis: along each cloud's own principal axes (longest first), move each spread toward k x the
+    # predicted spread of that axis, then rotate back (orientation unchanged)
+    def per_axis(p: np.ndarray, target_sd: np.ndarray, g: float) -> np.ndarray:
+        _, s, vt = np.linalg.svd(p, full_matrices=False)  # p is centred; rows of vt longest first
+        sd = s / np.sqrt(len(p))
+        return ((p @ vt.T) * (0.85 * target_sd / sd) ** g) @ vt
+
+    ours_ax = {g: np.stack([per_axis(ours[n], np.exp(ln_sd[:, n]), g) for n in range(len(ids))]) for g in (0.25, 0.5)}
+
+    names = (["ours"] + [f"sam_k{k:.2f}" for k in KS] + ["sam_true", "sam_flip"] + [f"mix_k{k:.2f}" for k in KS]
+             + ["ours_ax_g0.25", "ours_ax_g0.50"])
     S = np.full((len(names), len(ids)), np.nan)
     t32 = lambda a: torch.tensor(a, dtype=torch.float32, device=dev)  # noqa: E731
     with torch.inference_mode():
         for n, i in enumerate(ids):
             t = t32(g["gt"][n])
             S[0, n] = strict(t32(ours[n]), t)
+            S[-2, n] = strict(t32(ours_ax[0.25][n]), t)
+            S[-1, n] = strict(t32(ours_ax[0.5][n]), t)
             if keep[n]:
                 q = right_frame(sam[i])
                 sd_q = q.std(0)
