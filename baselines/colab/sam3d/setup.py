@@ -45,6 +45,7 @@ if not os.path.exists(f"{H}/Fast-SAM3D/checkpoints/moge-vitl"):
     sh("bash download_weights.sh")
 k = os.environ["SHARD"].split("/")[0]
 py = f"{H}/.venv-sam3d/bin/python"
+sh(f"uv pip install --python {py} -q 'setuptools<70' && {py} -c 'import pkg_resources'")  # lightning needs it
 sh(f"{py} gen_sam3d.py out/sam3d_train_s{k}.npz {train} --shard {os.environ['SHARD']}")
 sh(f"{py} gen_sam3d.py out/sam3d_eval_s{k}.npz {ev} --shard {os.environ['SHARD']}")
 LOG.write("SHARD DONE\n")

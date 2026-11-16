@@ -31,7 +31,7 @@ pipi "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c46
 # Later installs upgrade these; pin them back last (kaolin and flash-attn need torch 2.4.1, kaolin needs numpy 1,
 # transformers 4.46 needs huggingface_hub < 1).
 pipi --reinstall torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
-pipi "numpy<2" "huggingface_hub==0.26.5"
+pipi "numpy<2" "huggingface_hub==0.26.5" "setuptools<70"  # lightning imports pkg_resources (gone in new setuptools)
 
 # Two fixes to the Fast-SAM3D repo as published: an import of a solver its solver.py has commented out,
 # and a DINOv2 path pointing at its authors' disk.

@@ -8,6 +8,8 @@ timeout 300 colab new -s $S --gpu L4 2>&1 | tail -1
 echo 'import os; os.makedirs("/content/sam3d/out", exist_ok=True); print("dirs ok")' > /tmp/claude-1000/mk_sam3d.py
 timeout 120 colab exec -s $S -f /tmp/claude-1000/mk_sam3d.py 2>&1 | tail -1
 for f in install.sh download_weights.sh gen_sam3d.py fix_flow_matching_model.py fix_dino.py; do up $SRC/$f /content/sam3d/$f; done
+K=${SHARD%/*}; PART=$HERE/../../out/atlas/cloud/sam3d_all  # resume material pulled by guard.sh
+for f in train eval; do [ -f $PART/sam3d_${f}_s$K.npz ] && up $PART/sam3d_${f}_s$K.npz /content/sam3d/out/sam3d_${f}_s$K.npz; done
 echo "uploaded $(date +%H:%M)"
 timeout 30000 colab exec -s $S --timeout 29800 --env HF_TOKEN="$(tok HF_CLI_TOKEN)" --env KAGGLE_API_TOKEN="$(tok KAGGLE_THREE_TOKEN)" \
   --env SHARD="$SHARD" -f $HERE/setup.py 2>&1 | tail -3
