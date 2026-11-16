@@ -98,7 +98,7 @@ def seg_softmax(x: torch.Tensor, i: torch.Tensor, n: int) -> torch.Tensor:
 
 def fit(A: np.ndarray, B: np.ndarray, yt: np.ndarray, wt: np.ndarray, ct: np.ndarray, gt: np.ndarray,
         cq: np.ndarray, gq: np.ndarray, seed: int) -> dict[int, np.ndarray]:
-    """S4 on (A train, B query); returns {step: predicted y for B}."""
+    """S4 on (A train, B query); returns {step: (2, nq) predicted y for B and the weighted spread of the proposals}."""
     At, Bt, y, wobj = torch.from_numpy(A), torch.from_numpy(B), torch.tensor(yt, dtype=torch.float32), torch.tensor(wt, dtype=torch.float32)
     n, nq = len(At), len(Bt)
     ti, tj, tx = cand(ct, gt, ct, gt, True)
@@ -143,8 +143,10 @@ def fit(A: np.ndarray, B: np.ndarray, yt: np.ndarray, wt: np.ndarray, ct: np.nda
             enc.eval()
             with torch.no_grad():
                 v, lg = propose(enc(Bt), enc(At), qi, qj, qx)
-                m = torch.zeros(nq).index_add(0, qi, seg_softmax(lg, qi, nq) * v)
-            out[step] = torch.where(has, m, torch.tensor(fallback)).numpy().astype(np.float64)
+                wq = seg_softmax(lg, qi, nq)
+                m = torch.zeros(nq).index_add(0, qi, wq * v)
+                sd = torch.zeros(nq).index_add(0, qi, wq * (v - m[qi]) ** 2).sqrt()  # neighbours' disagreement
+            out[step] = np.stack([torch.where(has, m, torch.tensor(fallback)).numpy(), sd.numpy()]).astype(np.float64)
     return out
 
 
@@ -167,14 +169,14 @@ def train_all(y: np.ndarray, n_eval: int) -> tuple[dict[int, np.ndarray], dict[i
     tasks = [(k, m) for k in range(5) for m in range(K_BAG)] + [(-1, m) for m in range(K_SUB)]
     with get_context("fork").Pool(int(os.environ.get("SIZE_KNN_PROCS", 14))) as pool:  # fewer when RAM is short
         res = dict(pool.map(job, tasks))
-    oof = {s: np.zeros(len(y)) for s in CKPT}
-    ev = {s: np.zeros(n_eval) for s in CKPT}
+    oof = {s: np.zeros((2, len(y))) for s in CKPT}
+    ev = {s: np.zeros((2, n_eval)) for s in CKPT}
     for (k, m), r in res.items():
         for s, v in r.items():
             if k < 0:
                 ev[s] += v / K_SUB
             else:
-                oof[s][G["fold"] == k] += v / K_BAG
+                oof[s][:, G["fold"] == k] += v / K_BAG
     return oof, ev
 
 
@@ -228,12 +230,14 @@ def main() -> None:
             print(f"axis {a} trained {time.time() - t0:.0f} s", flush=True)
         for a, name in enumerate(("longest", "middle", "shortest")):
             for s in CKPT:
-                e = res[a][0][s] / 3 - np.log(sd[:, a])
+                e = res[a][0][s][0] / 3 - np.log(sd[:, a])
                 print(f"axis {name:8s} step {s}: median |log err| {np.median(np.abs(e)):.4f}  mean {np.mean(np.abs(e)):.4f}")
         out_dir.mkdir(parents=True, exist_ok=True)
         np.savez(out_dir / "size_knn_axes.npz", ids=np.array(ids), fold=fold, sd=sd, eval_ids=np.array(eids), steps=np.array(CKPT),
-                 oof_ln_sd=np.stack([np.stack([res[a][0][s] / 3 for a in range(3)]) for s in CKPT]),
-                 eval_ln_sd=np.stack([np.stack([res[a][1][s] / 3 for a in range(3)]) for s in CKPT]))
+                 oof_ln_sd=np.stack([np.stack([res[a][0][s][0] / 3 for a in range(3)]) for s in CKPT]),
+                 oof_spread=np.stack([np.stack([res[a][0][s][1] / 3 for a in range(3)]) for s in CKPT]),
+                 eval_ln_sd=np.stack([np.stack([res[a][1][s][0] / 3 for a in range(3)]) for s in CKPT]),
+                 eval_spread=np.stack([np.stack([res[a][1][s][1] / 3 for a in range(3)]) for s in CKPT]))
         print(f"saved {out_dir / 'size_knn_axes.npz'}  ({time.time() - t0:.0f} s)")
         return
     oof, ev = train_all(y, len(eids))
@@ -251,11 +255,12 @@ def main() -> None:
                                 f"by size quintile " + " ".join(f"{np.median(np.abs(e[quint == b])):.3f}" for b in range(5)))
     rep("category median", cat_med - true)
     for s in CKPT:
-        rep(f"size_knn step {s}", oof[s] / 3 - true)
+        rep(f"size_knn step {s}", oof[s][0] / 3 - true)
     tag = "_w" if weighted else ""
     out_dir.mkdir(parents=True, exist_ok=True)
     np.savez(out_dir / f"size_knn{tag}.npz", ids=np.array(ids), fold=fold, radius=radius, eval_ids=np.array(eids),
-             steps=np.array(CKPT), oof_ln_r=np.stack([oof[s] / 3 for s in CKPT]), eval_ln_r=np.stack([ev[s] / 3 for s in CKPT]))
+             steps=np.array(CKPT), oof_ln_r=np.stack([oof[s][0] / 3 for s in CKPT]), eval_ln_r=np.stack([ev[s][0] / 3 for s in CKPT]),
+             oof_spread=np.stack([oof[s][1] / 3 for s in CKPT]), eval_spread=np.stack([ev[s][1] / 3 for s in CKPT]))
     print(f"saved {out_dir / f'size_knn{tag}.npz'}  ({time.time() - t0:.0f} s)")
 
 

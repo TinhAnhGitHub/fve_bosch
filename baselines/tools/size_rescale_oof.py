@@ -27,8 +27,11 @@ sys.path.insert(0, str(ROOT / "baselines" / "tools"))
 from atlas import _load_cache, right_handed  # noqa: E402
 from mixlib import strict  # noqa: E402
 
-KS = (0.70, 0.73, 0.76, 0.79, 0.82, 0.85)
-GAMMAS = (0.25, 0.5, 0.75, 1.0)
+import os  # noqa: E402
+
+# Grid override for follow-up runs: RESCALE_KS / RESCALE_GAMMAS = comma lists.
+KS = tuple(float(v) for v in os.environ.get("RESCALE_KS", "0.70,0.73,0.76,0.79,0.82,0.85").split(","))
+GAMMAS = tuple(float(v) for v in os.environ.get("RESCALE_GAMMAS", "0.25,0.5,0.75,1.0").split(","))
 
 
 def main() -> None:
