@@ -7,11 +7,11 @@
 cd "$(dirname "$0")"; N=$1; OUT=../../out/atlas/cloud/sam3d_all; mkdir -p $OUT; round=0
 # setup.py splits each partial npz into 20 MB parts (colab download fails above ~100 MB); join them and keep the result
 # only if it loads.
-pull() { for f in train eval; do N=sam3d_${f}_s$1.npz; T=$(mktemp -d)
-  for n in 00 01 02 03 04 05 06 07 08 09; do timeout 600 colab download -s s3d$1 /content/sam3d/parts/$N/part$n $T/part$n > /dev/null 2>&1 || break; done
-  ls $T/part* > /dev/null 2>&1 && cat $T/part* > $T/$N && uv run -q --no-project --with numpy python -I -c \
-    "import numpy as np, sys; z = np.load(sys.argv[1]); print(len(z['ids']))" $T/$N > $T/n 2>/dev/null \
-    && mv $T/$N $OUT/$N && echo "$(date +%H:%M) s3d$1 pulled $N ($(cat $T/n) photos)"; rm -rf $T; done; }
+pull() { local f F T n; for f in train eval; do F=sam3d_${f}_s$1.npz; T=$(mktemp -d)
+  for n in 00 01 02 03 04 05 06 07 08 09; do timeout 600 colab download -s s3d$1 /content/sam3d/parts/$F/part$n $T/part$n > /dev/null 2>&1 || break; done
+  ls $T/part* > /dev/null 2>&1 && cat $T/part* > $T/$F && uv run -q --no-project --with numpy python -I -c \
+    "import numpy as np, sys; z = np.load(sys.argv[1]); print(len(z['ids']))" $T/$F > $T/n 2>/dev/null \
+    && mv $T/$F $OUT/$F && echo "$(date +%H:%M) s3d$1 pulled $F ($(cat $T/n) photos)"; rm -rf $T; done; }
 while true; do
   st=$(timeout 120 colab status 2>&1); left=0
   for k in $(seq 0 $((N-1))); do
