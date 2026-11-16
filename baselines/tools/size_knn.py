@@ -219,7 +219,10 @@ def main() -> None:
     print(f"projections ready {time.time() - t0:.0f} s", flush=True)
     if axes:
         sd = principal_sd(ids)
-        res = [train_all(3 * np.log(sd[:, a]), len(eids)) for a in range(3)]
+        res = []
+        for a in range(3):
+            res.append(train_all(3 * np.log(sd[:, a]), len(eids)))
+            print(f"axis {a} trained {time.time() - t0:.0f} s", flush=True)
         for a, name in enumerate(("longest", "middle", "shortest")):
             for s in CKPT:
                 e = res[a][0][s] / 3 - np.log(sd[:, a])
