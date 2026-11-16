@@ -12,7 +12,8 @@ Inputs: out-of-fold clouds of one recipe (oof.py predict) and out-of-fold sizes 
   3. strict score (mixlib.strict: centroid, then ICP) of every (k, gamma) on every object; (k, gamma) chosen on 4 folds
      and reported on the 5th, so the final number is out of sample. Paired bootstrap of the gain over gamma = 0.
 
-usage: size_rescale_oof.py OOF_CLOUDS.npz SIZE_KNN.npz STEP OUT.npz
+usage: size_rescale_oof.py OOF_CLOUDS.npz SIZE_KNN.npz STEP OUT.npz [GT.npz]
+  GT.npz: truth clouds; written (then exit) if missing, read if present.
 """
 import sys
 from pathlib import Path
@@ -60,11 +61,20 @@ def main() -> None:
 
     variants = [(1.0, 0.0)] + [(k, g) for k in KS for g in GAMMAS]
     factor = np.stack([(k * np.exp(comb) / own) ** g for k, g in variants])  # (V, n)
-    z, _ = _load_cache("dinov3l")
-    zid = z["ids"].tolist()
-    zpos = {i: n for n, i in enumerate(zid)}
-    rows = np.array([zpos[i] for i in ids])
-    gt = right_handed(z["pts"][rows], ids)
+    gt_path = Path(sys.argv[5]) if len(sys.argv) > 5 else None  # truth clouds file: lets a GPU VM skip train.npz
+    if gt_path and gt_path.exists():
+        g = np.load(gt_path)
+        assert g["ids"].tolist() == ids
+        gt = g["gt"]
+    else:
+        z, _ = _load_cache("dinov3l")
+        zid = z["ids"].tolist()
+        zpos = {i: n for n, i in enumerate(zid)}
+        rows = np.array([zpos[i] for i in ids])
+        gt = right_handed(z["pts"][rows], ids)
+        if gt_path:
+            np.savez(gt_path, ids=np.array(ids), gt=gt.astype(np.float32))
+            raise SystemExit(f"saved {gt_path}")
     S = np.zeros((len(variants), len(ids)))
     with torch.inference_mode():
         for n in range(len(ids)):

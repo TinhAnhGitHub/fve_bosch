@@ -24,6 +24,7 @@ usage: size_knn.py OUT_DIR [--weighted] [--axes]
           principal axis, one model each; writes size_knn_axes.npz with oof_ln_sd (steps, 3, 2042), eval_ln_sd, sd
 """
 import csv
+import os
 import sys
 import time
 from multiprocessing import get_context
@@ -164,7 +165,7 @@ def train_all(y: np.ndarray, n_eval: int) -> tuple[dict[int, np.ndarray], dict[i
     """Out-of-fold and eval predictions of target y (S4 scale: 3 ln size) averaged over model seeds."""
     G["y"] = y
     tasks = [(k, m) for k in range(5) for m in range(K_BAG)] + [(-1, m) for m in range(K_SUB)]
-    with get_context("fork").Pool(14) as pool:
+    with get_context("fork").Pool(int(os.environ.get("SIZE_KNN_PROCS", 14))) as pool:  # fewer when RAM is short
         res = dict(pool.map(job, tasks))
     oof = {s: np.zeros(len(y)) for s in CKPT}
     ev = {s: np.zeros(n_eval) for s in CKPT}
