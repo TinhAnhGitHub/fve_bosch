@@ -65,7 +65,17 @@ def main() -> None:
     variants = [(1.0, 0.0)] + [(k, g) for k in KS for g in GAMMAS]
     factor = np.stack([(k * np.exp(comb) / own) ** g for k, g in variants])  # (V, n)
     gt_path = Path(sys.argv[5]) if len(sys.argv) > 5 else None  # truth clouds file: lets a GPU VM skip train.npz
-    if gt_path and gt_path.exists():
+    # RESCALE_SHARD=k/n: score objects k, k+n, ... only, save the scores, stop (several VMs).
+    # RESCALE_SCORES=a.npz,b.npz: take the scores from those shard files instead of scoring, then analyse.
+    shard = os.environ.get("RESCALE_SHARD")
+    if os.environ.get("RESCALE_SCORES"):
+        S = np.full((len(variants), len(ids)), np.nan)
+        for f in os.environ["RESCALE_SCORES"].split(","):
+            part = np.load(f)
+            assert part["variants"].tolist() == [list(v) for v in variants]
+            S = np.where(np.isfinite(part["scores"]), part["scores"], S)
+        assert np.isfinite(S).all(), "shards do not cover every object"
+    elif gt_path and gt_path.exists():
         g = np.load(gt_path)
         assert g["ids"].tolist() == ids
         gt = g["gt"]
@@ -78,15 +88,20 @@ def main() -> None:
         if gt_path:
             np.savez(gt_path, ids=np.array(ids), gt=gt.astype(np.float32))
             raise SystemExit(f"saved {gt_path}")
-    S = np.zeros((len(variants), len(ids)))
-    with torch.inference_mode():
-        for n in range(len(ids)):
-            p = torch.tensor(pts[n], device=dev)
-            g = torch.tensor(gt[n], dtype=torch.float32, device=dev)
-            for v in range(len(variants)):
-                S[v, n] = strict(p * float(factor[v, n]), g)
-            if n % 200 == 0:
-                print(f"scored {n}/{len(ids)}", flush=True)
+    if not os.environ.get("RESCALE_SCORES"):
+        k0, kn = map(int, (shard or "0/1").split("/"))
+        S = np.full((len(variants), len(ids)), np.nan)
+        with torch.inference_mode():
+            for n in range(k0, len(ids), kn):
+                p = torch.tensor(pts[n], device=dev)
+                g = torch.tensor(gt[n], dtype=torch.float32, device=dev)
+                for v in range(len(variants)):
+                    S[v, n] = strict(p * float(factor[v, n]), g)
+                if n % 200 < kn:
+                    print(f"scored {n}/{len(ids)}", flush=True)
+        if shard:
+            np.savez(out, ids=np.array(ids), variants=np.array(variants), scores=S)
+            raise SystemExit(f"shard {shard} saved {out}")
     print(f"as predicted (gamma 0): mean {S[0].mean():.2f} median {np.median(S[0]):.2f}  (oof file says {np.nanmean(o['strict']):.2f})")
     for v, (k, g) in enumerate(variants[1:], 1):
         print(f"k {k:.2f} gamma {g:.2f}: mean {S[v].mean():6.2f} median {np.median(S[v]):6.2f}")

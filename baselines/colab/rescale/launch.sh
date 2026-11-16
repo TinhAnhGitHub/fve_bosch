@@ -17,7 +17,8 @@ up $SIZE /content/f3dr/data/$(basename $SIZE)
 for p in $PARTS/*.part*; do up $p /content/f3dr/data/$(basename $p); done
 echo "uploaded $(date +%H:%M)"
 timeout 14000 colab exec -s $S --timeout 13800 --env SIZE=$(basename $SIZE) --env STEP=$STEP \
-  --env RESCALE_KS=${RESCALE_KS:-0.70,0.73,0.76,0.79,0.82,0.85} --env RESCALE_GAMMAS=${RESCALE_GAMMAS:-0.25,0.5,0.75,1.0} -f $HERE/run.py 2>&1 | tail -4
+  --env RESCALE_KS=${RESCALE_KS:-0.70,0.73,0.76,0.79,0.82,0.85} --env RESCALE_GAMMAS=${RESCALE_GAMMAS:-0.25,0.5,0.75,1.0} \
+  --env RESCALE_SHARD=${RESCALE_SHARD:-} -f $HERE/run.py 2>&1 | tail -4
 timeout 300 colab download -s $S /content/f3dr/run.log $O/run/$S.log 2>&1 | tail -1
 timeout 300 colab download -s $S /content/f3dr/rescale.npz $O/run/$S.npz 2>&1 | tail -1
 timeout 120 colab stop -s $S 2>&1 | tail -1

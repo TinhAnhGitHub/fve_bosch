@@ -43,6 +43,36 @@ if not os.path.exists(f"{H}/.venv-sam3d/bin/python"):
     sh("bash install.sh")
 if not os.path.exists(f"{H}/Fast-SAM3D/checkpoints/moge-vitl"):
     sh("bash download_weights.sh")
+def split_parts() -> None:
+    """Every 10 min, copy each changed out/*.npz into 20 MB parts under parts/<name>/ (colab download fails >100 MB)."""
+    import shutil
+    import time
+    seen = {}
+    while True:
+        for f in glob.glob(f"{H}/out/*.npz"):
+            m = os.path.getmtime(f)
+            if seen.get(f) == m or time.time() - m < 20:  # unchanged, or possibly mid-write
+                continue
+            name = os.path.basename(f)
+            tmp, dst = f"{H}/parts/.{name}", f"{H}/parts/{name}"
+            shutil.rmtree(tmp, ignore_errors=True)
+            os.makedirs(tmp)
+            with open(f, "rb") as src:
+                n = 0
+                while chunk := src.read(20 << 20):
+                    with open(f"{tmp}/part{n:02d}", "wb") as out:
+                        out.write(chunk)
+                    n += 1
+            shutil.rmtree(dst, ignore_errors=True)
+            os.rename(tmp, dst)
+            seen[f] = m
+        time.sleep(600)
+
+
+import threading  # noqa: E402
+
+os.makedirs(f"{H}/parts", exist_ok=True)
+threading.Thread(target=split_parts, daemon=True).start()
 k = os.environ["SHARD"].split("/")[0]
 py = f"{H}/.venv-sam3d/bin/python"
 sh(f"uv pip install --python {py} -q 'setuptools<70' && {py} -c 'import pkg_resources'")  # lightning needs it
