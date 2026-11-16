@@ -49,7 +49,7 @@ def split_parts() -> None:
     import time
     seen = {}
     while True:
-        for f in glob.glob(f"{H}/out/*.npz"):
+        for f in glob.glob(f"{H}/Fast-SAM3D/out/*.npz"):  # gen_sam3d.py chdirs into Fast-SAM3D
             m = os.path.getmtime(f)
             if seen.get(f) == m or time.time() - m < 20:  # unchanged, or possibly mid-write
                 continue
@@ -75,6 +75,14 @@ os.makedirs(f"{H}/parts", exist_ok=True)
 threading.Thread(target=split_parts, daemon=True).start()
 k = os.environ["SHARD"].split("/")[0]
 py = f"{H}/.venv-sam3d/bin/python"
+os.makedirs(f"{H}/Fast-SAM3D/out", exist_ok=True)
+for name in {os.path.basename(p).split(".part")[0] for p in glob.glob(f"{H}/resume/*.part*")}:
+    dst = f"{H}/Fast-SAM3D/out/{name}"  # partial results uploaded in parts by launch.sh: gen_sam3d resumes from them
+    if not os.path.exists(dst):
+        with open(dst, "wb") as out:
+            for p in sorted(glob.glob(f"{H}/resume/{name}.part*")):
+                with open(p, "rb") as src:
+                    out.write(src.read())
 sh(f"uv pip install --python {py} -q 'setuptools<70' && {py} -c 'import pkg_resources'")  # lightning needs it
 sh(f"{py} gen_sam3d.py out/sam3d_train_s{k}.npz {train} --shard {os.environ['SHARD']}")
 sh(f"{py} gen_sam3d.py out/sam3d_eval_s{k}.npz {ev} --shard {os.environ['SHARD']}")

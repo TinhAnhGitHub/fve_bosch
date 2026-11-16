@@ -5,11 +5,13 @@
 #   session gone            -> new VM (launch.sh uploads the pulled partial files first)
 #   SHARD DONE              -> final pull, stop the VM
 cd "$(dirname "$0")"; N=$1; OUT=../../out/atlas/cloud/sam3d_all; mkdir -p $OUT; round=0
-# setup.py splits each partial npz into 20 MB parts (colab download fails above ~100 MB); join them and keep the result
-# only if it loads.
+# Pull each partial npz (gen_sam3d.py writes it under Fast-SAM3D/out): the whole file, or if that fails, the 20 MB parts
+# setup.py makes of it. Keep the result only if it loads.
 pull() { local f F T n; for f in train eval; do F=sam3d_${f}_s$1.npz; T=$(mktemp -d)
-  for n in 00 01 02 03 04 05 06 07 08 09; do timeout 600 colab download -s s3d$1 /content/sam3d/parts/$F/part$n $T/part$n > /dev/null 2>&1 || break; done
-  ls $T/part* > /dev/null 2>&1 && cat $T/part* > $T/$F && uv run -q --no-project --with numpy python -I -c \
+  if ! timeout 900 colab download -s s3d$1 /content/sam3d/Fast-SAM3D/out/$F $T/$F > /dev/null 2>&1; then rm -f $T/$F
+    for n in 00 01 02 03 04 05 06 07 08 09; do timeout 600 colab download -s s3d$1 /content/sam3d/parts/$F/part$n $T/part$n > /dev/null 2>&1 || break; done
+    ls $T/part* > /dev/null 2>&1 && cat $T/part* > $T/$F; fi
+  [ -s $T/$F ] && uv run -q --no-project --with numpy python -I -c \
     "import numpy as np, sys; z = np.load(sys.argv[1]); print(len(z['ids']))" $T/$F > $T/n 2>/dev/null \
     && mv $T/$F $OUT/$F && echo "$(date +%H:%M) s3d$1 pulled $F ($(cat $T/n) photos)"; rm -rf $T; done; }
 while true; do
