@@ -80,9 +80,18 @@ def main() -> None:
     names = (["ours"] + [f"sam_k{k:.2f}" for k in KS] + ["sam_true", "sam_flip"] + [f"mix_k{k:.2f}" for k in KS]
              + ["ours_ax_g0.25", "ours_ax_g0.50"])
     S = np.full((len(names), len(ids)), np.nan)
+    partial = out.with_name(out.stem + ".partial.npz")  # resume point: a dropped exec connection kills the job
+    if partial.exists():
+        with np.load(partial) as z:
+            if z["names"].tolist() == names:
+                S = z["scores"]
+    start = int(np.argmax(np.isnan(S[0]))) if np.isnan(S[0]).any() else len(ids)
+    print(f"starting at object {start}", flush=True)
     t32 = lambda a: torch.tensor(a, dtype=torch.float32, device=dev)  # noqa: E731
     with torch.inference_mode():
         for n, i in enumerate(ids):
+            if n < start:
+                continue
             t = t32(g["gt"][n])
             S[0, n] = strict(t32(ours[n]), t)
             S[-2, n] = strict(t32(ours_ax[0.25][n]), t)
@@ -102,6 +111,8 @@ def main() -> None:
                 S[2 + len(KS), n] = strict(p9 * best, t)
             if n % 200 == 0:
                 print(f"scored {n}/{len(ids)}", flush=True)
+            if n % 100 == 99:
+                np.savez(partial, names=np.array(names), scores=S)
 
     m = keep
     rng = np.random.default_rng(0)
