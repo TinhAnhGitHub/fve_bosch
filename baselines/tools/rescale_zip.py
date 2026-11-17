@@ -9,7 +9,10 @@ cloud's centre. own r = RMS radius of the submitted cloud, knn r = size_knn's ev
 k was tuned on single-recipe out-of-fold clouds (v27); a mixed zip has a different typical radius, so k is multiplied by
   calib = median(own / knn r) of this zip on the 511 photos  /  median(own / knn r) of the out-of-fold clouds.
 
-usage: rescale_zip.py SRC_ZIP SIZE_KNN.npz OOF_CLOUDS.npz STEP K GAMMA OUT_DIR
+Optional confidence rule (rescale_conf.py): photos whose size_knn neighbour spread (eval_spread) is above CUT use
+K2 / GAMMA2 instead of K / GAMMA.
+
+usage: rescale_zip.py SRC_ZIP SIZE_KNN.npz OOF_CLOUDS.npz STEP K GAMMA OUT_DIR [CUT K2 GAMMA2]
 """
 import io
 import sys
@@ -55,7 +58,14 @@ def main() -> None:
     own = np.array([rms(clouds[i]) for i in ids])
     knn = np.array([knn_eval[i] for i in ids])
     calib = np.median(own / knn) / np.median(oof_own / oof_knn)
-    new = own * (k * calib * knn / own) ** gamma
+    kk, gg = np.full(len(ids), k), np.full(len(ids), gamma)
+    if len(sys.argv) > 8:
+        cut, k2, g2 = float(sys.argv[8]), float(sys.argv[9]), float(sys.argv[10])
+        spread = dict(zip(sz["eval_ids"].tolist(), sz["eval_spread"][s]))
+        unsure = np.array([spread[i] > cut for i in ids])
+        kk[unsure], gg[unsure] = k2, g2
+        print(f"{unsure.sum()} of {len(ids)} photos above spread {cut}: k {k2} gamma {g2}; others k {k} gamma {gamma}")
+    new = own * (kk * calib * knn / own) ** gg
     print(f"calib {calib:.3f} (zip own/knn median {np.median(own / knn):.3f}, oof {np.median(oof_own / oof_knn):.3f})")
     print(f"new/own: median {np.median(new / own):.3f}, 5th-95th pct {np.percentile(new / own, 5):.3f}-"
           f"{np.percentile(new / own, 95):.3f}")
@@ -65,7 +75,7 @@ def main() -> None:
         c = clouds[i].mean(0)
         resized[i] = c + (clouds[i] - c) * (r_new / r_old)
     pack(out / "preds_geometry.zip", resized)
-    np.savez(out / "sizes.npz", ids=np.array(ids), own_mm=own, knn_mm=knn, new_mm=new, k=k, gamma=gamma, calib=calib)
+    np.savez(out / "sizes.npz", ids=np.array(ids), own_mm=own, knn_mm=knn, new_mm=new, k=kk, gamma=gg, calib=calib)
 
 
 if __name__ == "__main__":
